@@ -126,14 +126,18 @@ function Invoke-Adb {
 function Get-AdbDevices {
     param([string]$DevicesOutput)
     $devices = [System.Collections.Generic.List[object]]::new()
+    $lineNumber = 0
     foreach ($line in ($DevicesOutput -split "`r?`n")) {
+        $lineNumber++
         $trimmed = $line.Trim()
         if (-not $trimmed -or $trimmed -like 'List of devices attached*') { continue }
         if ($trimmed -match '^(\S+)\s+(\S+)(?:\s+(.*))?$') {
             $devices.Add([pscustomobject]@{
                 Serial = $matches[1]; State = $matches[2]; Details = $matches[3]
             })
+            continue
         }
+        throw "无法解析 ADB 设备列表中的非空行（第 $lineNumber 行）"
     }
     return @($devices)
 }
@@ -174,6 +178,7 @@ function Invoke-FocusDebugCollection {
     $exitCode = 30
     $focusCrashDetected = $false
     $resolvedAdb = $null
+    $adbReady = $false
     try {
         $resolvedAdb = Resolve-AdbExecutable -ExplicitPath $AdbPath
         if (-not $resolvedAdb) {
@@ -189,22 +194,7 @@ function Invoke-FocusDebugCollection {
             else {
                 $summary.adbPath = $resolvedAdb
                 Set-DebugCheck -Summary $summary -Id 'environment.adb' -Status 'PASS' -Message $null
-                $devicesResult = Invoke-Adb -AdbPath $resolvedAdb -Arguments @('devices', '-l')
-                if ($devicesResult.ExitCode -eq 0) {
-                    $devices = Get-AdbDevices -DevicesOutput $devicesResult.StdOut
-                    $selection = Select-AdbDevice -Devices $devices -RequestedSerial $Serial
-                    $summary.device.serialHint = $selection.UnauthorizedHint
-                    if ($selection.Selected) {
-                        $selectedSerial = $selection.Selected.Serial
-                        $summary.device.authorized = $true
-                        $summary.device.serialHint = Get-SafeSerialHint -Serial $selectedSerial
-                        Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'PASS' -Message $null
-                    }
-                    else {
-                        Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'FAIL' -Message $selection.Message
-                    }
-                }
-                $exitCode = 10
+                $adbReady = $true
             }
         }
     }
@@ -212,16 +202,52 @@ function Invoke-FocusDebugCollection {
         Set-DebugCheck -Summary $summary -Id 'environment.adb' -Status 'FAIL' -Message $_.Exception.Message
         $exitCode = if ($resolvedAdb) { 10 } else { 30 }
     }
+    if ($adbReady) {
+        try {
+            $devicesResult = Invoke-Adb -AdbPath $resolvedAdb -Arguments @('devices', '-l')
+            if ($devicesResult.ExitCode -ne 0) {
+                Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'FAIL' -Message '设备列表读取失败，请检查 ADB 输出或连接状态'
+                $exitCode = 10
+            }
+            else {
+                $devices = Get-AdbDevices -DevicesOutput $devicesResult.StdOut
+                $selection = Select-AdbDevice -Devices $devices -RequestedSerial $Serial
+                $summary.device.serialHint = $selection.UnauthorizedHint
+                if ($selection.Selected) {
+                    $selectedSerial = $selection.Selected.Serial
+                    $summary.device.authorized = $true
+                    $summary.device.serialHint = Get-SafeSerialHint -Serial $selectedSerial
+                    Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'PASS' -Message $null
+                }
+                else {
+                    Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'FAIL' -Message $selection.Message
+                }
+                $exitCode = 10
+            }
+        }
+        catch {
+            Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'FAIL' -Message "设备列表读取失败：$($_.Exception.Message)"
+            $exitCode = 30
+        }
+    }
     try {
         Write-DebugSummary -Summary $summary -OutputRoot $OutputRoot -FocusCrashDetected $focusCrashDetected
     }
     catch {
-        Write-Error "无法写入调试摘要: $($_.Exception.Message)" -ErrorAction Continue
+        $summaryPath = Join-Path ([IO.Path]::GetFullPath($OutputRoot)) 'summary.json'
+        Write-Error "无法写入调试摘要 [目标: $summaryPath]: $($_.Exception.Message)" -ErrorAction Continue
         return 20
     }
     Write-Host '模式: collect-only'
+    if ($summary.device.serialHint) {
+        Write-Host "设备: ****$($summary.device.serialHint)"
+    }
+    else {
+        Write-Host '设备: 未选择'
+    }
     Write-Host "结果: $($summary.overall)"
     Write-Host "摘要: $(Join-Path ([IO.Path]::GetFullPath($OutputRoot)) 'summary.json')"
+    Write-Host '隐私: 分享报告前请人工检查日志附件。'
     return $exitCode
 }
 

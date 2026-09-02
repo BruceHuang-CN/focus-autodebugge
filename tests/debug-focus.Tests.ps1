@@ -13,6 +13,19 @@ function Assert-Equal {
     }
 }
 
+function Assert-FakeAdbReadOnlyCalls {
+    param([string]$Calls)
+    $lines = @($Calls -split "`r?`n" | Where-Object { $_ })
+    foreach ($line in $lines) {
+        $parts = @($line -split "`t")
+        $allowed = ($parts.Count -eq 1 -and $parts[0] -ceq 'version') -or
+            ($parts.Count -eq 2 -and $parts[0] -ceq 'devices' -and $parts[1] -ceq '-l')
+        if (-not $allowed) {
+            throw "fake ADB 调用超出本批次白名单: $line"
+        }
+    }
+}
+
 function Get-Check {
     param($Summary, [string]$Id)
     return @($Summary.checks | Where-Object id -EQ $Id)[0]
@@ -54,6 +67,17 @@ function Invoke-ReportWriteFailureCase {
     try {
         $result = Invoke-DebugScriptProcess -Arguments @('-AdbPath', $missingAdb, '-OutputRoot', $outputRoot)
         Assert-Equal 20 $result.ExitCode '报告写入失败退出码不正确'
+        $summaryPath = Join-Path $outputRoot 'summary.json'
+        $consoleText = $result.Output -join "`n"
+        if ($consoleText -notmatch '无法写入调试摘要 \[目标:') {
+            throw '报告写入失败控制台必须标明目标 summary.json'
+        }
+        if ($consoleText -notmatch [regex]::Escape($summaryPath)) {
+            throw '报告写入失败控制台缺少目标 summary.json 路径'
+        }
+        if ($consoleText -notmatch 'Exception calling|Could not find|Cannot') {
+            throw '报告写入失败控制台必须包含异常原因'
+        }
     }
     finally {
         Remove-Item -LiteralPath $outputRoot -Force -ErrorAction SilentlyContinue
@@ -82,10 +106,14 @@ function Invoke-VersionOnlyAdbCase {
     $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-version-only-" + [guid]::NewGuid())
     $fakeAdb = Join-Path $outputRoot 'fake-adb.ps1'
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
-    @'
+@'
 param([string[]]$Arguments)
-if ($Arguments.Count -ne 1 -or $Arguments[0] -ne 'version') { exit 2 }
-exit 0
+if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'version') { exit 0 }
+if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'devices' -and $Arguments[1] -eq '-l') {
+    [Console]::Error.WriteLine('模拟设备列表读取失败')
+    exit 7
+}
+exit 2
 '@ | Set-Content -LiteralPath $fakeAdb -Encoding UTF8
     try {
         $result = Invoke-DebugScriptProcess -Arguments @('-AdbPath', $fakeAdb, '-OutputRoot', $outputRoot)
@@ -95,7 +123,10 @@ exit 0
         Assert-Equal 10 $result.ExitCode '设备前提未满足退出码不正确'
         Assert-Equal 'FAIL' $summary.overall '必需检查 SKIP 时 overall 应为 FAIL'
         Assert-Equal 'PASS' (Get-Check $summary 'environment.adb').status '假 ADB 版本检查状态不正确'
-        Assert-Equal 'SKIP' (Get-Check $summary 'device.authorized').status '设备检查状态不正确'
+        Assert-Equal 'FAIL' (Get-Check $summary 'device.authorized').status '设备列表读取失败时设备检查应为 FAIL'
+        if ((Get-Check $summary 'device.authorized').message -notmatch '设备列表读取失败') {
+            throw '设备列表读取失败消息不明确'
+        }
     }
     finally {
         Remove-Item -LiteralPath $outputRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -127,6 +158,7 @@ function Invoke-DebugCase {
         $calls = if (Test-Path -LiteralPath $callsPath) {
             Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
         } else { '' }
+        Assert-FakeAdbReadOnlyCalls -Calls $calls
         [pscustomobject]@{
             ExitCode = $exitCode
             Summary = $summary
@@ -148,6 +180,8 @@ function Invoke-RequestedSerialPrivacyCase {
     )
     $result = Invoke-DebugCase -Scenario $Scenario -ExtraArguments @('-Serial', $RequestedSerial)
     try {
+        Assert-Equal 10 $result.ExitCode '显式设备失败退出码不正确'
+        Assert-Equal 'FAIL' $result.Summary.overall '显式设备失败 overall 不正确'
         Assert-Equal 'FAIL' (Get-Check $result.Summary 'device.authorized').status '显式设备失败状态不正确'
         if (($result.Summary | ConvertTo-Json -Depth 8) -match [regex]::Escape($RequestedSerial)) {
             throw '摘要不应包含显式请求设备的完整序列号'
@@ -168,7 +202,7 @@ function Invoke-ShortRequestedSerialCase {
         if (($result.Summary | ConvertTo-Json -Depth 8) -match [regex]::Escape('ABC')) {
             throw '摘要不应包含长度不超过四位的原始序列号'
         }
-        if ($result.Console -match [regex]::Escape('ABC')) { throw '控制台不应包含长度不超过四位的原始序列号' }
+        if ($result.Console -cmatch [regex]::Escape('ABC')) { throw '控制台不应包含长度不超过四位的原始序列号' }
         if ($result.Calls -match '(?m)^-s\t') { throw '短显式设备失败时不应执行设备命令' }
     }
     finally {
@@ -225,7 +259,9 @@ try {
     try {
         Assert-Equal 'PASS' (Get-Check $selected.Summary 'device.authorized').status '没有接受明确指定的授权设备'
         Assert-Equal 'T456' $selected.Summary.device.serialHint '设备提示没有使用已选设备末四位'
-        if (($selected.Summary | ConvertTo-Json -Depth 8) -match 'TEST123') { throw '摘要错误包含未选择设备的完整序列号' }
+        $selectedJson = $selected.Summary | ConvertTo-Json -Depth 8
+        if ($selectedJson -match 'TEST123|TEST456') { throw '摘要不应包含任何完整设备序列号' }
+        if ($selected.Console -match 'TEST123|TEST456') { throw '控制台不应包含任何完整设备序列号' }
     }
     finally {
         Remove-Item -LiteralPath $selected.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -245,6 +281,9 @@ try {
     try {
         Assert-Equal 'PASS' (Get-Check $single.Summary 'device.authorized').status '单个授权设备未自动选择'
         Assert-Equal 'T123' $single.Summary.device.serialHint '自动选择设备提示不正确'
+        $singleJson = $single.Summary | ConvertTo-Json -Depth 8
+        if ($singleJson -match 'TEST123') { throw '摘要不应包含单设备完整序列号' }
+        if ($single.Console -match 'TEST123') { throw '控制台不应包含单设备完整序列号' }
     }
     finally {
         Remove-Item -LiteralPath $single.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -276,6 +315,24 @@ catch { $failures.Add("unexecutable-adb: $($_.Exception.Message)"); Write-Host '
 
 try { Invoke-VersionOnlyAdbCase; Write-Host 'PASS version-only-adb' }
 catch { $failures.Add("version-only-adb: $($_.Exception.Message)"); Write-Host 'FAIL version-only-adb' }
+
+try {
+    $malformed = Invoke-DebugCase -Scenario 'malformed'
+    try {
+        Assert-Equal 30 $malformed.ExitCode '设备输出解析异常退出码不正确'
+        Assert-Equal 'PASS' (Get-Check $malformed.Summary 'environment.adb').status '设备输出解析异常不应污染 ADB 环境状态'
+        Assert-Equal 'FAIL' (Get-Check $malformed.Summary 'device.authorized').status '设备输出解析异常状态不正确'
+        Assert-Equal 'FAIL' $malformed.Summary.overall '设备输出解析异常 overall 不正确'
+        if ((Get-Check $malformed.Summary 'device.authorized').message -notmatch '非空行') {
+            throw '设备输出解析异常消息必须说明拒绝了无法解析的非空行'
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $malformed.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS malformed-devices-output'
+}
+catch { $failures.Add("malformed-devices-output: $($_.Exception.Message)"); Write-Host 'FAIL malformed-devices-output' }
 
 if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Error $_ }

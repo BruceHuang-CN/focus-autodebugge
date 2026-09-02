@@ -11,6 +11,7 @@ if ($AdbArgs.Count -ge 2 -and $AdbArgs[0] -eq 'devices' -and $AdbArgs[1] -eq '-l
     'List of devices attached'
     switch ($scenario) {
         'unauthorized' { 'TEST123 unauthorized usb:1-1 transport_id:1' }
+        'malformed' { 'MALFORMED_DEVICE_LINE' }
         'multiple' {
             'TEST123 device product:test model:Phone_A transport_id:1'
             'TEST456 device product:test model:Phone_B transport_id:2'
