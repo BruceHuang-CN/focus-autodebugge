@@ -1,3 +1,5 @@
+param([switch]$OnlyShortSerial)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -157,6 +159,37 @@ function Invoke-RequestedSerialPrivacyCase {
     }
 }
 
+function Invoke-ShortRequestedSerialCase {
+    $result = Invoke-DebugCase -Scenario 'multiple' -ExtraArguments @('-Serial', 'ABC')
+    try {
+        $check = Get-Check $result.Summary 'device.authorized'
+        Assert-Equal 'FAIL' $check.status '短显式设备失败状态不正确'
+        Assert-Equal '指定设备不可用或未授权: ****' $check.message '短序列号安全提示不正确'
+        if (($result.Summary | ConvertTo-Json -Depth 8) -match [regex]::Escape('ABC')) {
+            throw '摘要不应包含长度不超过四位的原始序列号'
+        }
+        if ($result.Console -match [regex]::Escape('ABC')) { throw '控制台不应包含长度不超过四位的原始序列号' }
+        if ($result.Calls -match '(?m)^-s\t') { throw '短显式设备失败时不应执行设备命令' }
+    }
+    finally {
+        Remove-Item -LiteralPath $result.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($OnlyShortSerial) {
+    try {
+        Invoke-ShortRequestedSerialCase
+        Write-Host 'PASS short-requested-serial-privacy'
+    }
+    catch { $failures.Add("short-requested-serial-privacy: $($_.Exception.Message)"); Write-Host 'FAIL short-requested-serial-privacy' }
+
+    if ($failures.Count -gt 0) {
+        $failures | ForEach-Object { Write-Error $_ }
+        exit 1
+    }
+    exit 0
+}
+
 try {
     $unauthorized = Invoke-DebugCase -Scenario 'unauthorized'
     try {
@@ -200,6 +233,12 @@ try {
     Write-Host 'PASS selected-serial'
 }
 catch { $failures.Add("selected-serial: $($_.Exception.Message)"); Write-Host 'FAIL selected-serial' }
+
+try {
+    Invoke-ShortRequestedSerialCase
+    Write-Host 'PASS short-requested-serial-privacy'
+}
+catch { $failures.Add("short-requested-serial-privacy: $($_.Exception.Message)"); Write-Host 'FAIL short-requested-serial-privacy' }
 
 try {
     $single = Invoke-DebugCase -Scenario 'healthy'
