@@ -138,26 +138,32 @@ function Get-AdbDevices {
     return @($devices)
 }
 
+function Get-SafeSerialHint {
+    param([string]$Serial)
+    if (-not $Serial -or $Serial.Length -le 4) { return '****' }
+    return $Serial.Substring($Serial.Length - 4)
+}
+
 function Select-AdbDevice {
     param([object[]]$Devices, [string]$RequestedSerial)
     if ($RequestedSerial) {
         $match = @($Devices | Where-Object Serial -CEQ $RequestedSerial)
-        if ($match.Count -ne 1 -or $match[0].State -ne 'device') {
-            return [pscustomobject]@{ Selected = $null; Message = "指定设备不可用或未授权: $RequestedSerial"; UnauthorizedHint = $null }
+        if ($match.Count -ne 1 -or $match[0].State -CNE 'device') {
+            $requestedHint = Get-SafeSerialHint -Serial $RequestedSerial
+            return [pscustomobject]@{ Selected = $null; Message = "指定设备不可用或未授权: $requestedHint"; UnauthorizedHint = $null }
         }
         return [pscustomobject]@{ Selected = $match[0]; Message = $null; UnauthorizedHint = $null }
     }
-    $authorized = @($Devices | Where-Object State -EQ 'device')
+    $authorized = @($Devices | Where-Object State -CEQ 'device')
     if ($authorized.Count -eq 1) {
         return [pscustomobject]@{ Selected = $authorized[0]; Message = $null; UnauthorizedHint = $null }
     }
     if ($authorized.Count -gt 1) {
         return [pscustomobject]@{ Selected = $null; Message = '检测到多个已授权设备，请使用 -Serial 明确指定'; UnauthorizedHint = $null }
     }
-    $unauthorized = @($Devices | Where-Object State -EQ 'unauthorized')
+    $unauthorized = @($Devices | Where-Object State -CEQ 'unauthorized')
     $hint = if ($unauthorized.Count -eq 1) {
-        $value = $unauthorized[0].Serial
-        $value.Substring([Math]::Max(0, $value.Length - 4))
+        Get-SafeSerialHint -Serial $unauthorized[0].Serial
     } else { $null }
     $message = if ($unauthorized.Count -gt 0) { '设备已连接，但尚未授权 USB 调试' } else { '未发现已授权的 ADB 设备' }
     [pscustomobject]@{ Selected = $null; Message = $message; UnauthorizedHint = $hint }
@@ -191,7 +197,7 @@ function Invoke-FocusDebugCollection {
                     if ($selection.Selected) {
                         $selectedSerial = $selection.Selected.Serial
                         $summary.device.authorized = $true
-                        $summary.device.serialHint = $selectedSerial.Substring([Math]::Max(0, $selectedSerial.Length - 4))
+                        $summary.device.serialHint = Get-SafeSerialHint -Serial $selectedSerial
                         Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'PASS' -Message $null
                     }
                     else {

@@ -139,6 +139,24 @@ function Invoke-DebugCase {
     }
 }
 
+function Invoke-RequestedSerialPrivacyCase {
+    param(
+        [string]$Scenario,
+        [string]$RequestedSerial
+    )
+    $result = Invoke-DebugCase -Scenario $Scenario -ExtraArguments @('-Serial', $RequestedSerial)
+    try {
+        Assert-Equal 'FAIL' (Get-Check $result.Summary 'device.authorized').status '显式设备失败状态不正确'
+        if (($result.Summary | ConvertTo-Json -Depth 8) -match [regex]::Escape($RequestedSerial)) {
+            throw '摘要不应包含显式请求设备的完整序列号'
+        }
+        if ($result.Calls -match '(?m)^-s\t') { throw '显式设备失败时不应执行设备命令' }
+    }
+    finally {
+        Remove-Item -LiteralPath $result.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 try {
     $unauthorized = Invoke-DebugCase -Scenario 'unauthorized'
     try {
@@ -182,6 +200,31 @@ try {
     Write-Host 'PASS selected-serial'
 }
 catch { $failures.Add("selected-serial: $($_.Exception.Message)"); Write-Host 'FAIL selected-serial' }
+
+try {
+    $single = Invoke-DebugCase -Scenario 'healthy'
+    try {
+        Assert-Equal 'PASS' (Get-Check $single.Summary 'device.authorized').status '单个授权设备未自动选择'
+        Assert-Equal 'T123' $single.Summary.device.serialHint '自动选择设备提示不正确'
+    }
+    finally {
+        Remove-Item -LiteralPath $single.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS single-authorized-device'
+}
+catch { $failures.Add("single-authorized-device: $($_.Exception.Message)"); Write-Host 'FAIL single-authorized-device' }
+
+try {
+    Invoke-RequestedSerialPrivacyCase -Scenario 'multiple' -RequestedSerial 'TEST999'
+    Write-Host 'PASS requested-serial-missing-privacy'
+}
+catch { $failures.Add("requested-serial-missing-privacy: $($_.Exception.Message)"); Write-Host 'FAIL requested-serial-missing-privacy' }
+
+try {
+    Invoke-RequestedSerialPrivacyCase -Scenario 'unauthorized' -RequestedSerial 'TEST123'
+    Write-Host 'PASS requested-serial-unauthorized-privacy'
+}
+catch { $failures.Add("requested-serial-unauthorized-privacy: $($_.Exception.Message)"); Write-Host 'FAIL requested-serial-unauthorized-privacy' }
 
 try { Invoke-MissingAdbCase; Write-Host 'PASS missing-adb' }
 catch { $failures.Add("missing-adb: $($_.Exception.Message)"); Write-Host 'FAIL missing-adb' }
