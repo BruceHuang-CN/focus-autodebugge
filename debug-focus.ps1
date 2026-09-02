@@ -56,10 +56,10 @@ function Set-DebugCheck {
 
 function Write-DebugSummary {
     param($Summary, [string]$OutputRoot, [bool]$FocusCrashDetected = $false)
-    $requiredFailed = @($Summary.checks | Where-Object {
-        $_.id -in $script:RequiredChecks -and $_.status -eq 'FAIL'
+    $requiredNotPassed = @($Summary.checks | Where-Object {
+        $_.id -in $script:RequiredChecks -and $_.status -ne 'PASS'
     }).Count -gt 0
-    $Summary.overall = if ($requiredFailed -or $FocusCrashDetected) { 'FAIL' } else { 'PASS' }
+    $Summary.overall = if ($requiredNotPassed -or $FocusCrashDetected) { 'FAIL' } else { 'PASS' }
     $Summary.completedAt = [DateTimeOffset]::Now.ToString('o')
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     $json = $Summary | ConvertTo-Json -Depth 8
@@ -127,6 +127,7 @@ function Invoke-FocusDebugCollection {
     $summary = New-DebugSummary -PackageName $PackageName -StartedAt ([DateTimeOffset]::Now)
     $exitCode = 30
     $focusCrashDetected = $false
+    $resolvedAdb = $null
     try {
         $resolvedAdb = Resolve-AdbExecutable -ExplicitPath $AdbPath
         if (-not $resolvedAdb) {
@@ -149,13 +150,13 @@ function Invoke-FocusDebugCollection {
     }
     catch {
         Set-DebugCheck -Summary $summary -Id 'environment.adb' -Status 'FAIL' -Message $_.Exception.Message
-        $exitCode = 30
+        $exitCode = if ($resolvedAdb) { 10 } else { 30 }
     }
     try {
         Write-DebugSummary -Summary $summary -OutputRoot $OutputRoot -FocusCrashDetected $focusCrashDetected
     }
     catch {
-        Write-Error "无法写入调试摘要: $($_.Exception.Message)"
+        Write-Error "无法写入调试摘要: $($_.Exception.Message)" -ErrorAction Continue
         return 20
     }
     Write-Host '模式: collect-only'
