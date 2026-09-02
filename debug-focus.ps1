@@ -173,12 +173,197 @@ function Select-AdbDevice {
     [pscustomobject]@{ Selected = $null; Message = $message; UnauthorizedHint = $hint }
 }
 
+function Get-FirstNonEmptyLine {
+    param([string]$Text)
+    foreach ($line in ($Text -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed) { return $trimmed }
+    }
+    return $null
+}
+
+function Get-DeviceSnapshot {
+    param([string]$AdbPath, [string]$Serial)
+    $values = [ordered]@{
+        Manufacturer = $null
+        Model = $null
+        Android = $null
+        Sdk = $null
+    }
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $properties = [ordered]@{
+        Manufacturer = 'ro.product.manufacturer'
+        Model = 'ro.product.model'
+        Android = 'ro.build.version.release'
+        Sdk = 'ro.build.version.sdk'
+    }
+    foreach ($field in $properties.Keys) {
+        try {
+            $result = Invoke-Adb -AdbPath $AdbPath -Arguments @('-s', $Serial, 'shell', 'getprop', $properties[$field])
+            if ($result.ExitCode -eq 0) {
+                $values[$field] = Get-FirstNonEmptyLine -Text $result.StdOut
+                if (-not $values[$field]) { [void]$errors.Add($field) }
+            }
+            else {
+                [void]$errors.Add($field)
+            }
+        }
+        catch {
+            [void]$errors.Add($field)
+        }
+    }
+    [pscustomobject]@{
+        Manufacturer = $values.Manufacturer
+        Model = $values.Model
+        Android = $values.Android
+        Sdk = $values.Sdk
+        Errors = @($errors)
+        Complete = ($errors.Count -eq 0)
+    }
+}
+
+function Get-AppSnapshot {
+    param([string]$AdbPath, [string]$Serial, [string]$PackageName)
+    $snapshot = [ordered]@{
+        Installed = $null
+        VersionName = $null
+        VersionCode = $null
+        LastUpdateTime = $null
+        ProcessAlive = $null
+        AccessibilityEnabled = $null
+        InstalledCheck = 'FAIL'
+        ProvenanceCheck = 'SKIP'
+        ProcessCheck = 'SKIP'
+        AccessibilityCheck = 'SKIP'
+        Errors = [System.Collections.Generic.List[string]]::new()
+    }
+
+    try {
+        $pathResult = Invoke-Adb -AdbPath $AdbPath -Arguments @('-s', $Serial, 'shell', 'pm', 'path', $PackageName)
+    }
+    catch {
+        [void]$snapshot.Errors.Add('pm path')
+        return [pscustomobject]$snapshot
+    }
+    if ($pathResult.ExitCode -ne 0) {
+        [void]$snapshot.Errors.Add('pm path')
+        return [pscustomobject]$snapshot
+    }
+    $hasPackagePath = @($pathResult.StdOut -split "`r?`n" | Where-Object {
+        $_.Trim().StartsWith('package:', [StringComparison]::Ordinal)
+    }).Count -gt 0
+    if (-not $hasPackagePath) {
+        $snapshot.Installed = $false
+        $snapshot.InstalledCheck = 'FAIL'
+        return [pscustomobject]$snapshot
+    }
+    $snapshot.Installed = $true
+    $snapshot.InstalledCheck = 'PASS'
+
+    try {
+        $provenanceResult = Invoke-Adb -AdbPath $AdbPath -Arguments @('-s', $Serial, 'shell', 'dumpsys', 'package', $PackageName)
+        if ($provenanceResult.ExitCode -eq 0) {
+            foreach ($line in ($provenanceResult.StdOut -split "`r?`n")) {
+                if ($line -match '^\s*versionCode=(\d+)\b') { $snapshot.VersionCode = $matches[1] }
+                if ($line -match '^\s*versionName=(.*)$') { $snapshot.VersionName = $matches[1].Trim() }
+                if ($line -match '^\s*lastUpdateTime=(.*)$') { $snapshot.LastUpdateTime = $matches[1].Trim() }
+            }
+            if ($snapshot.VersionCode -and $snapshot.VersionName -and $snapshot.LastUpdateTime) {
+                $snapshot.ProvenanceCheck = 'PASS'
+            }
+            else {
+                $snapshot.ProvenanceCheck = 'FAIL'
+                [void]$snapshot.Errors.Add('dumpsys package')
+            }
+        }
+        else {
+            $snapshot.ProvenanceCheck = 'FAIL'
+            [void]$snapshot.Errors.Add('dumpsys package')
+        }
+    }
+    catch {
+        $snapshot.ProvenanceCheck = 'FAIL'
+        [void]$snapshot.Errors.Add('dumpsys package')
+    }
+
+    try {
+        $processResult = Invoke-Adb -AdbPath $AdbPath -Arguments @('-s', $Serial, 'shell', 'pidof', $PackageName)
+        $processOutput = $processResult.StdOut.Trim()
+        $processError = $processResult.StdErr.Trim()
+        if ($processResult.ExitCode -eq 0) {
+            $snapshot.ProcessAlive = [bool]$processOutput
+            $snapshot.ProcessCheck = 'PASS'
+        }
+        elseif ($processResult.ExitCode -eq 1 -and -not $processOutput -and -not $processError) {
+            $snapshot.ProcessAlive = $false
+            $snapshot.ProcessCheck = 'PASS'
+        }
+        else {
+            $snapshot.ProcessAlive = $null
+            $snapshot.ProcessCheck = 'FAIL'
+            [void]$snapshot.Errors.Add('pidof')
+        }
+    }
+    catch {
+        $snapshot.ProcessAlive = $null
+        $snapshot.ProcessCheck = 'FAIL'
+        [void]$snapshot.Errors.Add('pidof')
+    }
+
+    try {
+        $accessibilityResult = Invoke-Adb -AdbPath $AdbPath -Arguments @(
+            '-s', $Serial, 'shell', 'settings', 'get', 'secure', 'enabled_accessibility_services'
+        )
+        if ($accessibilityResult.ExitCode -eq 0) {
+            $prefix = "$PackageName/"
+            $snapshot.AccessibilityEnabled = $false
+            foreach ($service in ($accessibilityResult.StdOut -split ':')) {
+                if ($service.Trim().StartsWith($prefix, [StringComparison]::Ordinal)) {
+                    $snapshot.AccessibilityEnabled = $true
+                    break
+                }
+            }
+            $snapshot.AccessibilityCheck = 'PASS'
+        }
+        else {
+            $snapshot.AccessibilityEnabled = $null
+            $snapshot.AccessibilityCheck = 'FAIL'
+            [void]$snapshot.Errors.Add('accessibility')
+        }
+    }
+    catch {
+        $snapshot.AccessibilityEnabled = $null
+        $snapshot.AccessibilityCheck = 'FAIL'
+        [void]$snapshot.Errors.Add('accessibility')
+    }
+    [pscustomobject]$snapshot
+}
+
+function Convert-ToStateValue {
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    return [string]$Value
+}
+
+function Write-DebugAttachment {
+    param([string]$OutputRoot, [string]$FileName, [string[]]$Lines)
+    New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
+    [IO.File]::WriteAllLines(
+        (Join-Path $OutputRoot $FileName),
+        $Lines,
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
 function Invoke-FocusDebugCollection {
     $summary = New-DebugSummary -PackageName $PackageName -StartedAt ([DateTimeOffset]::Now)
     $exitCode = 30
     $focusCrashDetected = $false
     $resolvedAdb = $null
     $adbReady = $false
+    $selectedSerial = $null
+    $collectionFailed = $false
     try {
         $resolvedAdb = Resolve-AdbExecutable -ExplicitPath $AdbPath
         if (-not $resolvedAdb) {
@@ -218,11 +403,107 @@ function Invoke-FocusDebugCollection {
                     $summary.device.authorized = $true
                     $summary.device.serialHint = Get-SafeSerialHint -Serial $selectedSerial
                     Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'PASS' -Message $null
+
+                    try {
+                        New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
+
+                        $deviceSnapshot = Get-DeviceSnapshot -AdbPath $resolvedAdb -Serial $selectedSerial
+                        $summary.device.manufacturer = $deviceSnapshot.Manufacturer
+                        $summary.device.model = $deviceSnapshot.Model
+                        $summary.device.android = $deviceSnapshot.Android
+                        $summary.device.sdk = $deviceSnapshot.Sdk
+                        if ($deviceSnapshot.Complete) {
+                            Set-DebugCheck -Summary $summary -Id 'device.info' -Status 'PASS' -Message $null
+                        }
+                        else {
+                            $deviceErrors = if ($deviceSnapshot.Errors.Count -gt 0) {
+                                $deviceSnapshot.Errors -join ', '
+                            } else { '字段为空' }
+                            Set-DebugCheck -Summary $summary -Id 'device.info' -Status 'FAIL' -Message "设备基础信息读取失败: $deviceErrors"
+                        }
+                        try {
+                            Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'device-info.txt' -Lines @(
+                                "manufacturer=$(if ($null -eq $deviceSnapshot.Manufacturer) { '' } else { $deviceSnapshot.Manufacturer })",
+                                "model=$(if ($null -eq $deviceSnapshot.Model) { '' } else { $deviceSnapshot.Model })",
+                                "android=$(if ($null -eq $deviceSnapshot.Android) { '' } else { $deviceSnapshot.Android })",
+                                "sdk=$(if ($null -eq $deviceSnapshot.Sdk) { '' } else { $deviceSnapshot.Sdk })"
+                            )
+                            $summary.artifacts.deviceInfo = 'device-info.txt'
+                        }
+                        catch {
+                            $collectionFailed = $true
+                            Set-DebugCheck -Summary $summary -Id 'device.info' -Status 'FAIL' -Message '设备信息附件写入失败'
+                        }
+
+                        try {
+                            $appSnapshot = Get-AppSnapshot -AdbPath $resolvedAdb -Serial $selectedSerial -PackageName $PackageName
+                            $summary.app.installed = $appSnapshot.Installed
+                            $summary.app.versionName = $appSnapshot.VersionName
+                            $summary.app.versionCode = $appSnapshot.VersionCode
+                            $summary.app.lastUpdateTime = $appSnapshot.LastUpdateTime
+                            $summary.app.processAlive = $appSnapshot.ProcessAlive
+                            $summary.app.accessibilityEnabled = $appSnapshot.AccessibilityEnabled
+
+                            $installedMessage = if ($appSnapshot.InstalledCheck -eq 'PASS') {
+                                $null
+                            } elseif ($null -eq $appSnapshot.Installed) {
+                                '无法确认目标应用是否已安装'
+                            } else {
+                                '未找到目标应用包'
+                            }
+                            Set-DebugCheck -Summary $summary -Id 'app.installed' -Status $appSnapshot.InstalledCheck -Message $installedMessage
+                            $provenanceMessage = if ($appSnapshot.ProvenanceCheck -eq 'PASS') {
+                                $null
+                            } else { '应用版本来源信息不完整或读取失败' }
+                            Set-DebugCheck -Summary $summary -Id 'app.provenance' -Status $appSnapshot.ProvenanceCheck -Message $provenanceMessage
+                            $processMessage = if ($appSnapshot.ProcessCheck -eq 'PASS') {
+                                $null
+                            } else { '无法确认目标应用进程状态' }
+                            Set-DebugCheck -Summary $summary -Id 'app.process' -Status $appSnapshot.ProcessCheck -Message $processMessage
+                            $accessibilityMessage = if ($appSnapshot.AccessibilityCheck -eq 'PASS') {
+                                $null
+                            } else { '无法读取系统无障碍启用状态' }
+                            Set-DebugCheck -Summary $summary -Id 'permission.accessibility' -Status $appSnapshot.AccessibilityCheck -Message $accessibilityMessage
+
+                            try {
+                                Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'focus-state.txt' -Lines @(
+                                    "packageName=$PackageName",
+                                    "installed=$(Convert-ToStateValue -Value $appSnapshot.Installed)",
+                                    "versionName=$(Convert-ToStateValue -Value $appSnapshot.VersionName)",
+                                    "versionCode=$(Convert-ToStateValue -Value $appSnapshot.VersionCode)",
+                                    "lastUpdateTime=$(Convert-ToStateValue -Value $appSnapshot.LastUpdateTime)",
+                                    "processAlive=$(Convert-ToStateValue -Value $appSnapshot.ProcessAlive)",
+                                    "accessibilityEnabled=$(Convert-ToStateValue -Value $appSnapshot.AccessibilityEnabled)"
+                                )
+                                $summary.artifacts.focusState = 'focus-state.txt'
+                            }
+                            catch {
+                                $collectionFailed = $true
+                            }
+                        }
+                        catch {
+                            $collectionFailed = $true
+                            Set-DebugCheck -Summary $summary -Id 'app.installed' -Status 'FAIL' -Message '目标应用状态采集失败'
+                        }
+                    }
+                    catch {
+                        $collectionFailed = $true
+                        Set-DebugCheck -Summary $summary -Id 'device.info' -Status 'FAIL' -Message '设备状态采集失败'
+                        Set-DebugCheck -Summary $summary -Id 'app.installed' -Status 'FAIL' -Message '目标应用状态采集失败'
+                    }
                 }
                 else {
                     Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'FAIL' -Message $selection.Message
                 }
-                $exitCode = 10
+                if ($selection.Selected) {
+                    $requiredNotPassed = @($summary.checks | Where-Object {
+                        $_.id -in $script:RequiredChecks -and $_.status -ne 'PASS'
+                    }).Count -gt 0
+                    $exitCode = if ($requiredNotPassed) { 10 } elseif ($collectionFailed) { 30 } else { 0 }
+                }
+                else {
+                    $exitCode = 10
+                }
             }
         }
         catch {

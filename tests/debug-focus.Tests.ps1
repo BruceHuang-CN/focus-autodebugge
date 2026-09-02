@@ -14,12 +14,31 @@ function Assert-Equal {
 }
 
 function Assert-FakeAdbReadOnlyCalls {
-    param([string]$Calls)
+    param(
+        [string]$Calls,
+        [string]$SelectedSerial,
+        [string]$PackageName = 'com.example.focus_app'
+    )
     $lines = @($Calls -split "`r?`n" | Where-Object { $_ })
+    $allowedShellTails = @(
+        "shell getprop ro.product.manufacturer",
+        "shell getprop ro.product.model",
+        "shell getprop ro.build.version.release",
+        "shell getprop ro.build.version.sdk",
+        "shell pm path $PackageName",
+        "shell dumpsys package $PackageName",
+        "shell pidof $PackageName",
+        'shell settings get secure enabled_accessibility_services'
+    )
     foreach ($line in $lines) {
         $parts = @($line -split "`t")
         $allowed = ($parts.Count -eq 1 -and $parts[0] -ceq 'version') -or
             ($parts.Count -eq 2 -and $parts[0] -ceq 'devices' -and $parts[1] -ceq '-l')
+        if (-not $allowed -and $SelectedSerial -and $parts.Count -ge 3 -and
+            $parts[0] -ceq '-s' -and $parts[1] -ceq $SelectedSerial) {
+            $tail = (@($parts | Select-Object -Skip 2) -join ' ')
+            $allowed = $tail -in $allowedShellTails
+        }
         if (-not $allowed) {
             throw "fake ADB 调用超出本批次白名单: $line"
         }
@@ -29,6 +48,13 @@ function Assert-FakeAdbReadOnlyCalls {
 function Get-Check {
     param($Summary, [string]$Id)
     return @($Summary.checks | Where-Object id -EQ $Id)[0]
+}
+
+function Assert-TextKeyValue {
+    param([string]$Text, [string]$Key, [string]$ExpectedValue, [string]$Message)
+    $Text = $Text -replace "`r`n", "`n"
+    $pattern = "(?m)^$([regex]::Escape($Key))=$([regex]::Escape($ExpectedValue))$"
+    if ($Text -notmatch $pattern) { throw $Message }
 }
 
 function Invoke-DebugScriptProcess {
@@ -144,9 +170,30 @@ function Invoke-DebugCase {
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
     $previousScenario = $env:FOCUS_FAKE_ADB_SCENARIO
     $previousCalls = $env:FOCUS_FAKE_ADB_CALLS
+    $previousPackage = $env:FOCUS_FAKE_ADB_PACKAGE
+    $packageName = 'com.example.focus_app'
+    $requestedSerial = $null
+    for ($index = 0; $index -lt $ExtraArguments.Count; $index++) {
+        if ($ExtraArguments[$index] -eq '-PackageName' -and $index + 1 -lt $ExtraArguments.Count) {
+            $packageName = $ExtraArguments[$index + 1]
+        }
+        if ($ExtraArguments[$index] -eq '-Serial' -and $index + 1 -lt $ExtraArguments.Count) {
+            $requestedSerial = $ExtraArguments[$index + 1]
+        }
+    }
+    $expectedSerial = $null
+    if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed',
+            'accessibility-failed', 'accessibility-disabled', 'provenance-missing',
+            'dumpsys-failed', 'pm-path-failed')) {
+        $expectedSerial = 'TEST123'
+    }
+    if ($Scenario -eq 'multiple' -and $requestedSerial -eq 'TEST456') {
+        $expectedSerial = 'TEST456'
+    }
     try {
         $env:FOCUS_FAKE_ADB_SCENARIO = $Scenario
         $env:FOCUS_FAKE_ADB_CALLS = $callsPath
+        $env:FOCUS_FAKE_ADB_PACKAGE = $packageName
         $arguments = @(
             '-NoProfile', '-File', $scriptUnderTest,
             '-AdbPath', $fakeAdb,
@@ -158,18 +205,20 @@ function Invoke-DebugCase {
         $calls = if (Test-Path -LiteralPath $callsPath) {
             Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
         } else { '' }
-        Assert-FakeAdbReadOnlyCalls -Calls $calls
+        Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial $expectedSerial -PackageName $packageName
         [pscustomobject]@{
             ExitCode = $exitCode
             Summary = $summary
             Calls = $calls
             Console = $console
             OutputRoot = $outputRoot
+            PackageName = $packageName
         }
     }
     finally {
         $env:FOCUS_FAKE_ADB_SCENARIO = $previousScenario
         $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
+        $env:FOCUS_FAKE_ADB_PACKAGE = $previousPackage
     }
 }
 
@@ -269,6 +318,115 @@ try {
     Write-Host 'PASS selected-serial'
 }
 catch { $failures.Add("selected-serial: $($_.Exception.Message)"); Write-Host 'FAIL selected-serial' }
+
+try {
+    $healthy = Invoke-DebugCase -Scenario 'healthy'
+    try {
+        Assert-Equal 0 $healthy.ExitCode '健康场景退出码不正确'
+        Assert-Equal 'PASS' $healthy.Summary.overall '健康场景 overall 不正确'
+        Assert-Equal 'realme' $healthy.Summary.device.manufacturer '厂商解析错误'
+        Assert-Equal 'RMX3350' $healthy.Summary.device.model '型号解析错误'
+        Assert-Equal '11' $healthy.Summary.device.android 'Android 版本解析错误'
+        Assert-Equal '30' $healthy.Summary.device.sdk 'SDK 解析错误'
+        Assert-Equal $true $healthy.Summary.app.installed '安装状态错误'
+        Assert-Equal '1.2.3' $healthy.Summary.app.versionName '版本名解析错误'
+        Assert-Equal '42' $healthy.Summary.app.versionCode '版本号解析错误'
+        Assert-Equal '2026-09-02 12:34:56' $healthy.Summary.app.lastUpdateTime '更新时间解析错误'
+        Assert-Equal $true $healthy.Summary.app.processAlive '进程状态错误'
+        Assert-Equal $true $healthy.Summary.app.accessibilityEnabled '无障碍状态错误'
+        foreach ($checkId in @('device.info', 'app.installed', 'app.provenance', 'app.process', 'permission.accessibility')) {
+            Assert-Equal 'PASS' (Get-Check $healthy.Summary $checkId).status "$checkId 检查状态错误"
+        }
+        Assert-Equal 'device-info.txt' $healthy.Summary.artifacts.deviceInfo '设备附件路径错误'
+        Assert-Equal 'focus-state.txt' $healthy.Summary.artifacts.focusState 'Focus 附件路径错误'
+
+        $deviceInfo = Get-Content -LiteralPath (Join-Path $healthy.OutputRoot 'device-info.txt') -Raw -Encoding UTF8
+        $deviceInfo = ($deviceInfo -replace "`r`n", "`n").Trim()
+        Assert-Equal "manufacturer=realme`nmodel=RMX3350`nandroid=11`nsdk=30" $deviceInfo '设备附件内容错误'
+        if ($deviceInfo -match 'TEST123') { throw '设备附件不应包含完整设备序列号' }
+
+        $focusState = Get-Content -LiteralPath (Join-Path $healthy.OutputRoot 'focus-state.txt') -Raw -Encoding UTF8
+        Assert-TextKeyValue $focusState 'packageName' 'com.example.focus_app' 'Focus 附件缺少包名'
+        Assert-TextKeyValue $focusState 'installed' 'true' 'Focus 附件安装状态错误'
+        Assert-TextKeyValue $focusState 'versionName' '1.2.3' 'Focus 附件版本名错误'
+        Assert-TextKeyValue $focusState 'versionCode' '42' 'Focus 附件版本号错误'
+        Assert-TextKeyValue $focusState 'lastUpdateTime' '2026-09-02 12:34:56' 'Focus 附件更新时间错误'
+        Assert-TextKeyValue $focusState 'processAlive' 'true' 'Focus 附件进程状态错误'
+        Assert-TextKeyValue $focusState 'accessibilityEnabled' 'true' 'Focus 附件无障碍状态错误'
+        if ($focusState -match 'com\.other\.app|OtherAccessibilityService|enabled_accessibility_services') {
+            throw 'Focus 附件不应写入其他应用的无障碍服务列表'
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $healthy.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS healthy-device-and-app-state'
+}
+catch { $failures.Add("healthy-device-and-app-state: $($_.Exception.Message)"); Write-Host 'FAIL healthy-device-and-app-state' }
+
+try {
+    $customPackage = Invoke-DebugCase -Scenario 'healthy' -ExtraArguments @('-PackageName', 'com.example.focus_debug')
+    try {
+        Assert-Equal 'com.example.focus_debug' $customPackage.Summary.app.packageName '未使用 -PackageName 参数'
+        Assert-Equal $true $customPackage.Summary.app.installed '自定义包安装状态错误'
+        if ($customPackage.Calls -match 'com\.example\.focus_app') { throw '自定义包场景不应调用默认包名' }
+    }
+    finally {
+        Remove-Item -LiteralPath $customPackage.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS custom-package-name'
+}
+catch { $failures.Add("custom-package-name: $($_.Exception.Message)"); Write-Host 'FAIL custom-package-name' }
+
+try {
+    $notInstalled = Invoke-DebugCase -Scenario 'not-installed'
+    try {
+        Assert-Equal 10 $notInstalled.ExitCode '未安装场景退出码不正确'
+        Assert-Equal 'FAIL' $notInstalled.Summary.overall '未安装场景 overall 不正确'
+        Assert-Equal $false $notInstalled.Summary.app.installed '未安装状态错误'
+        Assert-Equal $null $notInstalled.Summary.app.processAlive '未安装时进程状态必须为 null'
+        Assert-Equal $null $notInstalled.Summary.app.accessibilityEnabled '未安装时无障碍状态必须为 null'
+        Assert-Equal 'FAIL' (Get-Check $notInstalled.Summary 'app.installed').status '未安装检查状态错误'
+        foreach ($checkId in @('app.provenance', 'app.process', 'permission.accessibility')) {
+            Assert-Equal 'SKIP' (Get-Check $notInstalled.Summary $checkId).status "$checkId 在未安装时应跳过"
+        }
+        if ($notInstalled.Calls -match 'dumpsys|pidof|enabled_accessibility_services') {
+            throw '未安装时不应读取版本、进程或无障碍依赖状态'
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $notInstalled.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS focus-not-installed'
+}
+catch { $failures.Add("focus-not-installed: $($_.Exception.Message)"); Write-Host 'FAIL focus-not-installed' }
+
+try {
+    $stopped = Invoke-DebugCase -Scenario 'stopped'
+    try {
+        Assert-Equal 0 $stopped.ExitCode '未运行场景退出码不正确'
+        Assert-Equal $false $stopped.Summary.app.processAlive '未运行状态错误'
+        Assert-Equal 'PASS' (Get-Check $stopped.Summary 'app.process').status '未运行时进程检查应为 PASS'
+    }
+    finally {
+        Remove-Item -LiteralPath $stopped.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS focus-not-running'
+}
+catch { $failures.Add("focus-not-running: $($_.Exception.Message)"); Write-Host 'FAIL focus-not-running' }
+
+try {
+    $pidofFailed = Invoke-DebugCase -Scenario 'pidof-failed'
+    try {
+        Assert-Equal $null $pidofFailed.Summary.app.processAlive 'pidof 未知失败时进程状态必须为 null'
+        Assert-Equal 'FAIL' (Get-Check $pidofFailed.Summary 'app.process').status 'pidof 未知失败时进程检查应为 FAIL'
+    }
+    finally {
+        Remove-Item -LiteralPath $pidofFailed.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS focus-process-unknown'
+}
+catch { $failures.Add("focus-process-unknown: $($_.Exception.Message)"); Write-Host 'FAIL focus-process-unknown' }
 
 try {
     Invoke-ShortRequestedSerialCase
