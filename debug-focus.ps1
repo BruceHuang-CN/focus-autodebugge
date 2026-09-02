@@ -26,6 +26,7 @@ function New-DebugSummary {
         overall = 'FAIL'
         startedAt = $StartedAt.ToString('o')
         completedAt = $null
+        collectionFailed = $false
         adbPath = $null
         device = [ordered]@{
             authorized = $false; serialHint = $null; manufacturer = $null
@@ -55,11 +56,17 @@ function Set-DebugCheck {
 }
 
 function Write-DebugSummary {
-    param($Summary, [string]$OutputRoot, [bool]$FocusCrashDetected = $false)
+    param(
+        $Summary,
+        [string]$OutputRoot,
+        [bool]$FocusCrashDetected = $false,
+        [bool]$CollectionFailed = $false
+    )
     $requiredNotPassed = @($Summary.checks | Where-Object {
         $_.id -in $script:RequiredChecks -and $_.status -ne 'PASS'
     }).Count -gt 0
-    $Summary.overall = if ($requiredNotPassed -or $FocusCrashDetected) { 'FAIL' } else { 'PASS' }
+    $Summary.collectionFailed = $CollectionFailed
+    $Summary.overall = if ($requiredNotPassed -or $FocusCrashDetected -or $CollectionFailed) { 'FAIL' } else { 'PASS' }
     $Summary.completedAt = [DateTimeOffset]::Now.ToString('o')
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     $json = $Summary | ConvertTo-Json -Depth 8
@@ -512,7 +519,7 @@ function Invoke-FocusDebugCollection {
         }
     }
     try {
-        Write-DebugSummary -Summary $summary -OutputRoot $OutputRoot -FocusCrashDetected $focusCrashDetected
+        Write-DebugSummary -Summary $summary -OutputRoot $OutputRoot -FocusCrashDetected $focusCrashDetected -CollectionFailed $collectionFailed
     }
     catch {
         $summaryPath = Join-Path ([IO.Path]::GetFullPath($OutputRoot)) 'summary.json'

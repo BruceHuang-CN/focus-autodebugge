@@ -1,4 +1,7 @@
-param([switch]$OnlyShortSerial)
+param(
+    [switch]$OnlyShortSerial,
+    [switch]$OnlyPidofEmpty
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -63,6 +66,55 @@ function Invoke-DebugScriptProcess {
     [pscustomobject]@{
         ExitCode = $LASTEXITCODE
         Output = $capturedOutput
+    }
+}
+
+function Invoke-FakeAdbVector {
+    param([string[]]$Arguments)
+    $fakeAdb = Join-Path $PSScriptRoot 'fixtures\fake-adb.ps1'
+    $capturedOutput = @(& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File $fakeAdb @Arguments 2>&1)
+    [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output = $capturedOutput
+    }
+}
+
+function Assert-FakeAdbRejectsVector {
+    param([string[]]$Arguments, [string]$Label)
+    $result = Invoke-FakeAdbVector -Arguments $Arguments
+    if ($result.ExitCode -eq 0) {
+        throw "$Label 必须返回非零退出码"
+    }
+    $output = $result.Output -join "`n"
+    if ($output -match 'List of devices attached|TEST123 device|Android Debug Bridge version|(?m)^realme$|(?m)^RMX3350$') {
+        throw "$Label 不得输出正常 fake ADB 结果"
+    }
+}
+
+function Invoke-FakeAdbStrictWhitelistCase {
+    Assert-FakeAdbRejectsVector -Arguments @('VERSION') -Label 'version 大小写变体'
+    Assert-FakeAdbRejectsVector -Arguments @('version', 'EXTRA') -Label 'version 多余参数'
+    Assert-FakeAdbRejectsVector -Arguments @('DEVICES', '-l') -Label 'devices 大小写变体'
+    Assert-FakeAdbRejectsVector -Arguments @('devices', '-L') -Label 'devices -l 大小写变体'
+    Assert-FakeAdbRejectsVector -Arguments @('devices', '-l', 'EXTRA') -Label 'devices -l 多余参数'
+    Assert-FakeAdbRejectsVector -Arguments @('devices', '-l', '-s', 'TEST123') -Label 'devices -l 额外向量'
+
+    $tailTexts = @(
+        'shell getprop ro.product.manufacturer',
+        'shell getprop ro.product.model',
+        'shell getprop ro.build.version.release',
+        'shell getprop ro.build.version.sdk',
+        'shell pm path com.example.focus_app',
+        'shell dumpsys package com.example.focus_app',
+        'shell pidof com.example.focus_app',
+        'shell settings get secure enabled_accessibility_services'
+    )
+    foreach ($tailText in $tailTexts) {
+        $tail = @($tailText -split ' ')
+        $caseVariant = @($tail)
+        $caseVariant[0] = $caseVariant[0].ToUpperInvariant()
+        Assert-FakeAdbRejectsVector -Arguments (@('-s', 'TEST123') + $caseVariant) -Label "$tailText 大小写变体"
+        Assert-FakeAdbRejectsVector -Arguments (@('-s', 'TEST123') + @($tail + 'EXTRA')) -Label "$tailText 多余参数"
     }
 }
 
@@ -182,7 +234,7 @@ function Invoke-DebugCase {
         }
     }
     $expectedSerial = $null
-    if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed',
+    if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed', 'pidof-empty',
             'accessibility-failed', 'accessibility-disabled', 'provenance-missing',
             'dumpsys-failed', 'pm-path-failed')) {
         $expectedSerial = 'TEST123'
@@ -213,6 +265,42 @@ function Invoke-DebugCase {
             Console = $console
             OutputRoot = $outputRoot
             PackageName = $packageName
+        }
+    }
+    finally {
+        $env:FOCUS_FAKE_ADB_SCENARIO = $previousScenario
+        $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
+        $env:FOCUS_FAKE_ADB_PACKAGE = $previousPackage
+    }
+}
+
+function Invoke-FocusStateWriteFailureCase {
+    $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-focus-state-dir-" + [guid]::NewGuid())
+    $callsPath = Join-Path $outputRoot 'adb-calls.txt'
+    $fakeAdb = Join-Path $PSScriptRoot 'fixtures\fake-adb.ps1'
+    New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $outputRoot 'focus-state.txt') -Force | Out-Null
+    $previousScenario = $env:FOCUS_FAKE_ADB_SCENARIO
+    $previousCalls = $env:FOCUS_FAKE_ADB_CALLS
+    $previousPackage = $env:FOCUS_FAKE_ADB_PACKAGE
+    try {
+        $env:FOCUS_FAKE_ADB_SCENARIO = 'healthy'
+        $env:FOCUS_FAKE_ADB_CALLS = $callsPath
+        $env:FOCUS_FAKE_ADB_PACKAGE = 'com.example.focus_app'
+        $console = & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File $scriptUnderTest `
+            -AdbPath $fakeAdb -OutputRoot $outputRoot 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $summary = Get-Content -LiteralPath (Join-Path $outputRoot 'summary.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $calls = if (Test-Path -LiteralPath $callsPath) {
+            Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
+        } else { '' }
+        Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial 'TEST123'
+        [pscustomobject]@{
+            ExitCode = $exitCode
+            Summary = $summary
+            Calls = $calls
+            Console = $console
+            OutputRoot = $outputRoot
         }
     }
     finally {
@@ -259,6 +347,18 @@ function Invoke-ShortRequestedSerialCase {
     }
 }
 
+function Invoke-PidofEmptyCase {
+    $result = Invoke-DebugCase -Scenario 'pidof-empty'
+    try {
+        Assert-Equal 0 $result.ExitCode 'pidof 退出码 0 且空输出时退出码不正确'
+        Assert-Equal $false $result.Summary.app.processAlive 'pidof 退出码 0 且空输出时进程状态必须为 false'
+        Assert-Equal 'PASS' (Get-Check $result.Summary 'app.process').status 'pidof 退出码 0 且空输出时进程检查应为 PASS'
+    }
+    finally {
+        Remove-Item -LiteralPath $result.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($OnlyShortSerial) {
     try {
         Invoke-ShortRequestedSerialCase
@@ -271,6 +371,31 @@ if ($OnlyShortSerial) {
         exit 1
     }
     exit 0
+}
+
+if ($OnlyPidofEmpty) {
+    try {
+        Invoke-PidofEmptyCase
+        Write-Host 'PASS pidof-empty'
+    }
+    catch {
+        $failures.Add("pidof-empty: $($_.Exception.Message)")
+        Write-Host 'FAIL pidof-empty'
+    }
+    if ($failures.Count -gt 0) {
+        $failures | ForEach-Object { Write-Error $_ }
+        exit 1
+    }
+    exit 0
+}
+
+try {
+    Invoke-FakeAdbStrictWhitelistCase
+    Write-Host 'PASS fake-adb-strict-whitelist'
+}
+catch {
+    $failures.Add("fake-adb-strict-whitelist: $($_.Exception.Message)")
+    Write-Host 'FAIL fake-adb-strict-whitelist'
 }
 
 try {
@@ -379,6 +504,23 @@ try {
 catch { $failures.Add("custom-package-name: $($_.Exception.Message)"); Write-Host 'FAIL custom-package-name' }
 
 try {
+    $stateWriteFailure = Invoke-FocusStateWriteFailureCase
+    try {
+        Assert-Equal 30 $stateWriteFailure.ExitCode 'Focus 状态附件写入失败退出码不正确'
+        Assert-Equal 'FAIL' $stateWriteFailure.Summary.overall 'Focus 状态附件写入失败时 overall 必须为 FAIL'
+        Assert-Equal $null $stateWriteFailure.Summary.artifacts.focusState '附件写入失败时不应保留 focusState 指针'
+        $collectionFailureProperty = @($stateWriteFailure.Summary.PSObject.Properties | Where-Object Name -EQ 'collectionFailed')
+        if ($collectionFailureProperty.Count -ne 1) { throw '摘要必须包含统一 collectionFailed 失败信号' }
+        Assert-Equal $true $stateWriteFailure.Summary.collectionFailed '摘要 collectionFailed 失败信号错误'
+    }
+    finally {
+        Remove-Item -LiteralPath $stateWriteFailure.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS focus-state-write-failure'
+}
+catch { $failures.Add("focus-state-write-failure: $($_.Exception.Message)"); Write-Host 'FAIL focus-state-write-failure' }
+
+try {
     $notInstalled = Invoke-DebugCase -Scenario 'not-installed'
     try {
         Assert-Equal 10 $notInstalled.ExitCode '未安装场景退出码不正确'
@@ -427,6 +569,12 @@ try {
     Write-Host 'PASS focus-process-unknown'
 }
 catch { $failures.Add("focus-process-unknown: $($_.Exception.Message)"); Write-Host 'FAIL focus-process-unknown' }
+
+try {
+    Invoke-PidofEmptyCase
+    Write-Host 'PASS pidof-empty'
+}
+catch { $failures.Add("pidof-empty: $($_.Exception.Message)"); Write-Host 'FAIL pidof-empty' }
 
 try {
     Invoke-ShortRequestedSerialCase
