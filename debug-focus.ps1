@@ -123,6 +123,46 @@ function Invoke-Adb {
     Invoke-ExternalCommand -FilePath $AdbPath -Arguments $Arguments
 }
 
+function Get-AdbDevices {
+    param([string]$DevicesOutput)
+    $devices = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in ($DevicesOutput -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed -like 'List of devices attached*') { continue }
+        if ($trimmed -match '^(\S+)\s+(\S+)(?:\s+(.*))?$') {
+            $devices.Add([pscustomobject]@{
+                Serial = $matches[1]; State = $matches[2]; Details = $matches[3]
+            })
+        }
+    }
+    return @($devices)
+}
+
+function Select-AdbDevice {
+    param([object[]]$Devices, [string]$RequestedSerial)
+    if ($RequestedSerial) {
+        $match = @($Devices | Where-Object Serial -CEQ $RequestedSerial)
+        if ($match.Count -ne 1 -or $match[0].State -ne 'device') {
+            return [pscustomobject]@{ Selected = $null; Message = "指定设备不可用或未授权: $RequestedSerial"; UnauthorizedHint = $null }
+        }
+        return [pscustomobject]@{ Selected = $match[0]; Message = $null; UnauthorizedHint = $null }
+    }
+    $authorized = @($Devices | Where-Object State -EQ 'device')
+    if ($authorized.Count -eq 1) {
+        return [pscustomobject]@{ Selected = $authorized[0]; Message = $null; UnauthorizedHint = $null }
+    }
+    if ($authorized.Count -gt 1) {
+        return [pscustomobject]@{ Selected = $null; Message = '检测到多个已授权设备，请使用 -Serial 明确指定'; UnauthorizedHint = $null }
+    }
+    $unauthorized = @($Devices | Where-Object State -EQ 'unauthorized')
+    $hint = if ($unauthorized.Count -eq 1) {
+        $value = $unauthorized[0].Serial
+        $value.Substring([Math]::Max(0, $value.Length - 4))
+    } else { $null }
+    $message = if ($unauthorized.Count -gt 0) { '设备已连接，但尚未授权 USB 调试' } else { '未发现已授权的 ADB 设备' }
+    [pscustomobject]@{ Selected = $null; Message = $message; UnauthorizedHint = $hint }
+}
+
 function Invoke-FocusDebugCollection {
     $summary = New-DebugSummary -PackageName $PackageName -StartedAt ([DateTimeOffset]::Now)
     $exitCode = 30
@@ -143,7 +183,21 @@ function Invoke-FocusDebugCollection {
             else {
                 $summary.adbPath = $resolvedAdb
                 Set-DebugCheck -Summary $summary -Id 'environment.adb' -Status 'PASS' -Message $null
-                Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'SKIP' -Message '设备选择由下一任务加入'
+                $devicesResult = Invoke-Adb -AdbPath $resolvedAdb -Arguments @('devices', '-l')
+                if ($devicesResult.ExitCode -eq 0) {
+                    $devices = Get-AdbDevices -DevicesOutput $devicesResult.StdOut
+                    $selection = Select-AdbDevice -Devices $devices -RequestedSerial $Serial
+                    $summary.device.serialHint = $selection.UnauthorizedHint
+                    if ($selection.Selected) {
+                        $selectedSerial = $selection.Selected.Serial
+                        $summary.device.authorized = $true
+                        $summary.device.serialHint = $selectedSerial.Substring([Math]::Max(0, $selectedSerial.Length - 4))
+                        Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'PASS' -Message $null
+                    }
+                    else {
+                        Set-DebugCheck -Summary $summary -Id 'device.authorized' -Status 'FAIL' -Message $selection.Message
+                    }
+                }
                 $exitCode = 10
             }
         }

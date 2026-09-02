@@ -100,6 +100,89 @@ exit 0
     }
 }
 
+function Invoke-DebugCase {
+    param(
+        [string]$Scenario,
+        [string[]]$ExtraArguments = @()
+    )
+    $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-" + [guid]::NewGuid())
+    $callsPath = Join-Path $outputRoot 'adb-calls.txt'
+    $fakeAdb = Join-Path $PSScriptRoot 'fixtures\fake-adb.ps1'
+    New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+    $previousScenario = $env:FOCUS_FAKE_ADB_SCENARIO
+    $previousCalls = $env:FOCUS_FAKE_ADB_CALLS
+    try {
+        $env:FOCUS_FAKE_ADB_SCENARIO = $Scenario
+        $env:FOCUS_FAKE_ADB_CALLS = $callsPath
+        $arguments = @(
+            '-NoProfile', '-File', $scriptUnderTest,
+            '-AdbPath', $fakeAdb,
+            '-OutputRoot', $outputRoot
+        ) + $ExtraArguments
+        $console = & (Join-Path $PSHOME 'pwsh.exe') @arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $summary = Get-Content -LiteralPath (Join-Path $outputRoot 'summary.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $calls = if (Test-Path -LiteralPath $callsPath) {
+            Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
+        } else { '' }
+        [pscustomobject]@{
+            ExitCode = $exitCode
+            Summary = $summary
+            Calls = $calls
+            Console = $console
+            OutputRoot = $outputRoot
+        }
+    }
+    finally {
+        $env:FOCUS_FAKE_ADB_SCENARIO = $previousScenario
+        $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
+    }
+}
+
+try {
+    $unauthorized = Invoke-DebugCase -Scenario 'unauthorized'
+    try {
+        Assert-Equal 10 $unauthorized.ExitCode '未授权设备退出码不正确'
+        Assert-Equal 'FAIL' (Get-Check $unauthorized.Summary 'device.authorized').status '未授权状态不正确'
+        if ($unauthorized.Calls -match '(?m)^-s\t') { throw '未授权场景不应执行设备 shell 命令' }
+    }
+    finally {
+        Remove-Item -LiteralPath $unauthorized.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS unauthorized-device'
+}
+catch { $failures.Add("unauthorized-device: $($_.Exception.Message)"); Write-Host 'FAIL unauthorized-device' }
+
+try {
+    $multiple = Invoke-DebugCase -Scenario 'multiple'
+    try {
+        Assert-Equal 10 $multiple.ExitCode '多设备退出码不正确'
+        if ((Get-Check $multiple.Summary 'device.authorized').message -notmatch '-Serial') {
+            throw '多设备错误消息必须提示 -Serial'
+        }
+        if ($multiple.Calls -match '(?m)^-s\t') { throw '未明确选中设备时不应执行设备命令' }
+    }
+    finally {
+        Remove-Item -LiteralPath $multiple.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS multiple-devices'
+}
+catch { $failures.Add("multiple-devices: $($_.Exception.Message)"); Write-Host 'FAIL multiple-devices' }
+
+try {
+    $selected = Invoke-DebugCase -Scenario 'multiple' -ExtraArguments @('-Serial', 'TEST456')
+    try {
+        Assert-Equal 'PASS' (Get-Check $selected.Summary 'device.authorized').status '没有接受明确指定的授权设备'
+        Assert-Equal 'T456' $selected.Summary.device.serialHint '设备提示没有使用已选设备末四位'
+        if (($selected.Summary | ConvertTo-Json -Depth 8) -match 'TEST123') { throw '摘要错误包含未选择设备的完整序列号' }
+    }
+    finally {
+        Remove-Item -LiteralPath $selected.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'PASS selected-serial'
+}
+catch { $failures.Add("selected-serial: $($_.Exception.Message)"); Write-Host 'FAIL selected-serial' }
+
 try { Invoke-MissingAdbCase; Write-Host 'PASS missing-adb' }
 catch { $failures.Add("missing-adb: $($_.Exception.Message)"); Write-Host 'FAIL missing-adb' }
 
