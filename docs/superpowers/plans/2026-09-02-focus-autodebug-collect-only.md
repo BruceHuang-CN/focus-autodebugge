@@ -111,7 +111,7 @@ function Invoke-MissingAdbCase {
     $missingAdb = Join-Path $outputRoot 'does-not-exist\adb.exe'
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
     try {
-        & $PSHOME\pwsh.exe -NoProfile -File $scriptUnderTest -AdbPath $missingAdb -OutputRoot $outputRoot
+        & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File $scriptUnderTest -AdbPath $missingAdb -OutputRoot $outputRoot
         $exitCode = $LASTEXITCODE
         $summaryPath = Join-Path $outputRoot 'summary.json'
         if (-not (Test-Path -LiteralPath $summaryPath)) { throw '未生成 summary.json' }
@@ -142,7 +142,7 @@ Run:
 
 ```powershell
 Set-Location D:\focus-autodebug
-& $PSHOME\pwsh.exe -NoProfile -File .\tests\debug-focus.Tests.ps1
+& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File .\tests\debug-focus.Tests.ps1
 ```
 
 Expected: 退出码为 `1`，失败原因是 `debug-focus.ps1` 不存在或没有生成 `summary.json`。
@@ -351,7 +351,7 @@ exit $exitCode
 Run:
 
 ```powershell
-& $PSHOME\pwsh.exe -NoProfile -File D:\focus-autodebug\tests\debug-focus.Tests.ps1
+& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File D:\focus-autodebug\tests\debug-focus.Tests.ps1
 ```
 
 Expected: `PASS missing-adb`，进程退出码为 `0`。这里的 `0` 是测试运行器通过；被测脚本在该场景中的退出码仍为 `10`。
@@ -430,7 +430,7 @@ function Invoke-DebugCase {
             '-AdbPath', $fakeAdb,
             '-OutputRoot', $outputRoot
         ) + $ExtraArguments
-        $console = & $PSHOME\pwsh.exe @arguments 2>&1 | Out-String
+        $console = & (Join-Path $PSHOME 'pwsh.exe') @arguments 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
         $summary = Get-Content -LiteralPath (Join-Path $outputRoot 'summary.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $calls = if (Test-Path -LiteralPath $callsPath) {
@@ -467,8 +467,9 @@ if ((Get-Check $multiple.Summary 'device.authorized').message -notmatch '-Serial
 if ($multiple.Calls -match '(?m)^-s\t') { throw '未明确选中设备时不应执行设备命令' }
 
 $selected = Invoke-DebugCase -Scenario 'multiple' -ExtraArguments @('-Serial','TEST456')
-if ($selected.Calls -notmatch '(?m)^-s\tTEST456\t') { throw '没有使用明确指定的设备' }
-if ($selected.Calls -match '(?m)^-s\tTEST123\t') { throw '错误调用了未选择设备' }
+Assert-Equal 'PASS' (Get-Check $selected.Summary 'device.authorized').status '没有接受明确指定的授权设备'
+Assert-Equal 'T456' $selected.Summary.device.serialHint '设备提示没有使用已选设备末四位'
+if (($selected.Summary | ConvertTo-Json -Depth 8) -match 'TEST123') { throw '摘要错误包含未选择设备的完整序列号' }
 ```
 
 - [ ] **Step 3: 运行新增测试，确认 RED**
@@ -529,7 +530,7 @@ function Select-AdbDevice {
 
 - [ ] **Step 6: 运行测试，确认 GREEN**
 
-Expected: 四个场景全部通过；调用日志证明未授权和多设备未指定时没有任何以 `-s` 开头的调用。
+Expected: 四个场景全部通过；调用日志证明未授权和多设备未指定时没有任何以 `-s` 开头的调用，明确指定场景只在摘要中保留已选设备末四位。
 
 - [ ] **Step 7: 提交 Task 2**
 
