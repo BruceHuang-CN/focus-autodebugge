@@ -58,6 +58,27 @@ function Assert-FakeAdbReadOnlyCalls {
     }
 }
 
+function Assert-FakeAdbLogcatCallCount {
+    param([string]$Calls, [string]$SelectedSerial, [int]$ExpectedCount, [string]$Message)
+    $validLogcats = @(
+        $Calls -split "`r?`n" |
+            Where-Object { $_ } |
+            Where-Object {
+                $parts = @($_ -split "`t")
+                $parts.Count -eq 8 -and
+                    $parts[0] -ceq '-s' -and
+                    $parts[1] -ceq $SelectedSerial -and
+                    $parts[2] -ceq 'logcat' -and
+                    $parts[3] -ceq '-d' -and
+                    $parts[4] -ceq '-T' -and
+                    $parts[5] -cmatch '^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$' -and
+                    $parts[6] -ceq '-v' -and
+                    $parts[7] -ceq 'threadtime'
+            }
+    )
+    Assert-Equal $ExpectedCount $validLogcats.Count $Message
+}
+
 function Get-Check {
     param($Summary, [string]$Id)
     return @($Summary.checks | Where-Object id -EQ $Id)[0]
@@ -150,6 +171,22 @@ function Invoke-ExitCodeFormulaGuardCase {
     }
 }
 
+function Invoke-ProductionReadOnlyCommandGuardCase {
+    $source = Get-Content -LiteralPath $scriptUnderTest -Raw -Encoding UTF8
+    $forbiddenPatterns = @(
+        "(?i)@\([^\)]*'logcat'[^\)]*'-c'",
+        "(?i)@\([^\)]*'install'",
+        "(?i)@\([^\)]*'uninstall'",
+        "(?i)@\([^\)]*'pm'\s*,\s*'clear'",
+        "(?i)@\([^\)]*'pm'\s*,\s*'grant'",
+        "(?i)@\([^\)]*'settings'\s*,\s*'put'",
+        "(?i)@\([^\)]*'input'\s*,\s*'(?:tap|swipe|keyevent|text)'"
+    )
+    foreach ($pattern in $forbiddenPatterns) {
+        if ($source -match $pattern) { throw "生产脚本包含禁止的状态修改调用: $pattern" }
+    }
+}
+
 function Invoke-MissingAdbCase {
     $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-" + [guid]::NewGuid())
     $missingAdb = Join-Path $outputRoot 'does-not-exist\adb.exe'
@@ -215,9 +252,25 @@ function Invoke-UnexecutableAdbCase {
 function Invoke-VersionOnlyAdbCase {
     $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-version-only-" + [guid]::NewGuid())
     $fakeAdb = Join-Path $outputRoot 'fake-adb.ps1'
+    $callsPath = Join-Path $outputRoot 'adb-calls.txt'
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 @'
 param([string[]]$Arguments)
+$commandLineArgs = @([Environment]::GetCommandLineArgs())
+$fileIndex = -1
+for ($index = 0; $index -lt $commandLineArgs.Count; $index++) {
+    if ($commandLineArgs[$index] -ceq '-File') {
+        $fileIndex = $index
+        break
+    }
+}
+$firstScriptArgument = $fileIndex + 2
+if ($fileIndex -ge 0 -and $firstScriptArgument -lt $commandLineArgs.Count) {
+    $Arguments = @($commandLineArgs[$firstScriptArgument..($commandLineArgs.Count - 1)])
+}
+if ($env:FOCUS_FAKE_ADB_CALLS) {
+    [IO.File]::AppendAllText($env:FOCUS_FAKE_ADB_CALLS, (($Arguments -join "`t") + "`n"))
+}
 if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'version') { exit 0 }
 if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'devices' -and $Arguments[1] -eq '-l') {
     [Console]::Error.WriteLine('模拟设备列表读取失败')
@@ -225,11 +278,18 @@ if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'devices' -and $Arguments[1] -
 }
 exit 2
 '@ | Set-Content -LiteralPath $fakeAdb -Encoding UTF8
+    $previousCalls = $env:FOCUS_FAKE_ADB_CALLS
     try {
+        $env:FOCUS_FAKE_ADB_CALLS = $callsPath
         $result = Invoke-DebugScriptProcess -Arguments @('-AdbPath', $fakeAdb, '-OutputRoot', $outputRoot)
         $summaryPath = Join-Path $outputRoot 'summary.json'
         if (-not (Test-Path -LiteralPath $summaryPath)) { throw '未生成 summary.json' }
         $summary = Get-Content -LiteralPath $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $calls = if (Test-Path -LiteralPath $callsPath) {
+            Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
+        } else { '' }
+        Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial $null
+        if ($calls -match '(?m)^-s\t') { throw 'ADB 设备列表失败时不应执行设备命令' }
         Assert-Equal 10 $result.ExitCode '设备前提未满足退出码不正确'
         Assert-Equal 'FAIL' $summary.overall '必需检查 SKIP 时 overall 应为 FAIL'
         Assert-Equal 'PASS' (Get-Check $summary 'environment.adb').status '假 ADB 版本检查状态不正确'
@@ -239,6 +299,7 @@ exit 2
         }
     }
     finally {
+        $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
         Remove-Item -LiteralPath $outputRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -295,6 +356,11 @@ function Invoke-DebugCase {
             Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
         } else { '' }
         Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial $expectedSerial -PackageName $packageName
+        if ($expectedSerial) {
+            $expectedLogcatCount = if ($Scenario -in @('not-installed', 'pm-path-failed')) { 0 } else { 1 }
+            Assert-FakeAdbLogcatCallCount -Calls $calls -SelectedSerial $expectedSerial `
+                -ExpectedCount $expectedLogcatCount -Message "logcat 调用数量错误: $Scenario"
+        }
         [pscustomobject]@{
             ExitCode = $exitCode
             Summary = $summary
@@ -308,6 +374,35 @@ function Invoke-DebugCase {
         $env:FOCUS_FAKE_ADB_SCENARIO = $previousScenario
         $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
         $env:FOCUS_FAKE_ADB_PACKAGE = $previousPackage
+    }
+}
+
+function Invoke-InvalidLogWindowCase {
+    param([int]$LogWindowMinutes)
+    $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-log-window-" + [guid]::NewGuid())
+    $callsPath = Join-Path $outputRoot 'adb-calls.txt'
+    $fakeAdb = Join-Path $PSScriptRoot 'fixtures\fake-adb.ps1'
+    New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+    $previousCalls = $env:FOCUS_FAKE_ADB_CALLS
+    try {
+        $env:FOCUS_FAKE_ADB_CALLS = $callsPath
+        $result = Invoke-DebugScriptProcess -Arguments @(
+            '-AdbPath', $fakeAdb,
+            '-OutputRoot', $outputRoot,
+            '-LogWindowMinutes', $LogWindowMinutes
+        )
+        if ($result.ExitCode -eq 0) { throw "LogWindowMinutes=$LogWindowMinutes 必须被参数绑定拒绝" }
+        $output = $result.Output -join "`n"
+        if ($output -notmatch 'ValidationMetadataException|(?:minimum|maximum) allowed range') {
+            throw "LogWindowMinutes=$LogWindowMinutes 缺少范围验证错误"
+        }
+        if (Test-Path -LiteralPath $callsPath) {
+            throw "LogWindowMinutes=$LogWindowMinutes 被拒绝后不应调用 fake ADB"
+        }
+    }
+    finally {
+        $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
+        Remove-Item -LiteralPath $outputRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -332,6 +427,8 @@ function Invoke-FocusStateWriteFailureCase {
             Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
         } else { '' }
         Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial 'TEST123'
+        Assert-FakeAdbLogcatCallCount -Calls $calls -SelectedSerial 'TEST123' -ExpectedCount 1 `
+            -Message 'Focus 状态附件失败场景必须只读取一次 logcat'
         [pscustomobject]@{
             ExitCode = $exitCode
             Summary = $summary
@@ -373,6 +470,8 @@ function Invoke-LogAttachmentWriteFailureCase {
             Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
         } else { '' }
         Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial $expectedSerial
+        Assert-FakeAdbLogcatCallCount -Calls $calls -SelectedSerial $expectedSerial -ExpectedCount 1 `
+            -Message '日志附件失败场景必须只读取一次 logcat'
         [pscustomobject]@{
             ExitCode = $exitCode
             Summary = $summary
@@ -486,6 +585,25 @@ catch {
 }
 
 try {
+    Invoke-ProductionReadOnlyCommandGuardCase
+    Write-Host 'PASS production-read-only-command-guard'
+}
+catch {
+    $failures.Add("production-read-only-command-guard: $($_.Exception.Message)")
+    Write-Host 'FAIL production-read-only-command-guard'
+}
+
+try {
+    Invoke-InvalidLogWindowCase -LogWindowMinutes 0
+    Invoke-InvalidLogWindowCase -LogWindowMinutes 61
+    Write-Host 'PASS log-window-parameter-boundaries'
+}
+catch {
+    $failures.Add("log-window-parameter-boundaries: $($_.Exception.Message)")
+    Write-Host 'FAIL log-window-parameter-boundaries'
+}
+
+try {
     $unauthorized = Invoke-DebugCase -Scenario 'unauthorized'
     try {
         Assert-Equal 10 $unauthorized.ExitCode '未授权设备退出码不正确'
@@ -536,6 +654,30 @@ try {
     try {
         Assert-Equal 0 $healthy.ExitCode '健康场景退出码不正确'
         Assert-Equal 'PASS' $healthy.Summary.overall '健康场景 overall 不正确'
+        Assert-Equal 1 $healthy.Summary.schemaVersion 'schemaVersion 错误'
+        Assert-Equal 'collect-only' $healthy.Summary.mode 'mode 错误'
+        [void][DateTimeOffset]::Parse($healthy.Summary.startedAt)
+        [void][DateTimeOffset]::Parse($healthy.Summary.completedAt)
+        $ids = @($healthy.Summary.checks | ForEach-Object id)
+        foreach ($id in @(
+            'environment.adb','device.authorized','device.info','app.installed',
+            'app.provenance','app.process','permission.accessibility','logs.focus','logs.crash'
+        )) {
+            Assert-Equal 1 @($ids | Where-Object { $_ -ceq $id }).Count "检查项数量错误: $id"
+        }
+        foreach ($artifact in $healthy.Summary.artifacts.PSObject.Properties) {
+            if ([string]::IsNullOrWhiteSpace([string]$artifact.Value)) { continue }
+            $fileName = [string]$artifact.Value
+            if ($fileName -match '\.\.|[\\/]') { throw "附件必须是简单文件名: $fileName" }
+            $artifactPath = Join-Path $healthy.OutputRoot $fileName
+            if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+                throw "附件不在输出目录中: $fileName"
+            }
+            if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($artifactPath)) -cne
+                [IO.Path]::GetFullPath($healthy.OutputRoot)) {
+                throw "附件不在输出目录根目录中: $fileName"
+            }
+        }
         Assert-Equal 'realme' $healthy.Summary.device.manufacturer '厂商解析错误'
         Assert-Equal 'RMX3350' $healthy.Summary.device.model '型号解析错误'
         Assert-Equal '11' $healthy.Summary.device.android 'Android 版本解析错误'
