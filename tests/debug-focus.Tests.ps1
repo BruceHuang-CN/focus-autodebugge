@@ -674,7 +674,7 @@ try {
             if ($text -match [regex]::Escape($secretExpectation.Sentinel)) {
                 throw "日志附件泄露密钥或 bearer token: $($secretExpectation.Sentinel)"
             }
-            if ($text -notmatch [regex]::Escape($secretExpectation.Redacted)) {
+            if ($text -cnotmatch [regex]::Escape($secretExpectation.Redacted)) {
                 throw "日志脱敏没有保留明确替换标记: $($secretExpectation.Redacted)"
             }
         }
