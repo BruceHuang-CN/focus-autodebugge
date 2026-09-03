@@ -47,6 +47,23 @@ $isLogcatRead = $tail.Count -eq 6 -and
     $tail[5] -ceq 'threadtime'
 
 if ($isLogcatRead) {
+    if ($scenario -ceq 'foreign-crash') {
+        @"
+09-02 20:00:00.000  9000  9000 E AndroidRuntime: FATAL EXCEPTION: main
+09-02 20:00:00.001  9000  9000 E AndroidRuntime: Process: com.other.app, PID: 9000
+09-02 20:00:00.002  9000  9000 E AndroidRuntime: java.lang.IllegalStateException: FOREIGN_CRASH_SENTINEL
+09-02 20:00:01.000  2468  2468 I FocusDebug: package=$fixturePackage healthy
+"@
+        exit 0
+    }
+    if ($scenario -ceq 'focus-crash') {
+        @"
+09-02 20:00:00.000  2468  2468 E AndroidRuntime: FATAL EXCEPTION: main
+09-02 20:00:00.001  2468  2468 E AndroidRuntime: Process: $fixturePackage, PID: 2468
+09-02 20:00:00.002  2468  2468 E AndroidRuntime: java.lang.IllegalStateException: FOCUS_CRASH_SENTINEL
+"@
+        exit 0
+    }
     @"
 09-02 20:00:00.000  2468  2468 I FocusDebug: Focus startup complete
 09-02 20:00:00.010  9000  9000 I OtherApp: OTHER_PRIVATE_SENTINEL

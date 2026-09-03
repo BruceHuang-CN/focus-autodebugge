@@ -412,27 +412,39 @@ function Get-FocusLogSnapshot {
         if ([string]$processId -cmatch '^\d+$') { [void]$focusPidSet.Add([string]$processId) }
     }
     $packagePattern = [regex]::Escape($PackageName)
-    $packageTokenPattern = "(?<![A-Za-z0-9_.])$packagePattern(?![A-Za-z0-9_.])"
-    $processPattern = "Process:\s*$packageTokenPattern,\s*PID:\s*(?<pid>\d+)"
+    $processPattern = "^Process:\s*$packagePattern,\s*PID:\s*(?<pid>\d+)\s*$"
+    $tombstonePackagePattern = ">>>\s*$packagePattern\s*<<<"
     foreach ($parsed in $parsedLines) {
-        if ($parsed.Raw -cmatch $processPattern) {
+        if ($parsed.Message -cmatch $processPattern) {
+            [void]$focusPidSet.Add([string]$matches.pid)
+        }
+        if ($parsed.Message -cmatch $tombstonePackagePattern -and $parsed.Message -cmatch 'pid:\s*(?<pid>\d+)') {
             [void]$focusPidSet.Add([string]$matches.pid)
         }
     }
 
     $focusLines = [System.Collections.Generic.List[string]]::new()
+    $crashLines = [System.Collections.Generic.List[string]]::new()
+    $focusCrashDetected = $false
     foreach ($parsed in $parsedLines) {
         # 只有已知 Focus PID 的行可进入附件；任意消息中的包名提及不是归属证明。
         $belongsToFocus = $focusPidSet.Contains([string]$parsed.ProcessId)
         if ($belongsToFocus) {
             [void]$focusLines.Add((Protect-FocusLogLine -Line $parsed.Raw))
         }
+        $fatal = ($parsed.Message -cmatch '^FATAL EXCEPTION:') -and $belongsToFocus
+        $anr = $parsed.Message -cmatch "^ANR in $packagePattern(?:\s|$)"
+        $tombstone = $parsed.Message -cmatch $tombstonePackagePattern
+        if ($fatal -or $anr -or $tombstone) { $focusCrashDetected = $true }
+        if (($parsed.Tag -ceq 'AndroidRuntime' -and $belongsToFocus) -or $anr -or $tombstone) {
+            [void]$crashLines.Add((Protect-FocusLogLine -Line $parsed.Raw))
+        }
     }
 
     [pscustomobject]@{
         FocusLines = @($focusLines.ToArray())
-        CrashLines = @()
-        FocusCrashDetected = $false
+        CrashLines = @($crashLines.ToArray())
+        FocusCrashDetected = $focusCrashDetected
     }
 }
 
@@ -596,7 +608,14 @@ function Invoke-FocusDebugCollection {
                                         Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message '时间窗口内没有 Focus 相关日志'
                                     }
                                     if ($focusCrashDetected) {
-                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'FAIL' -Message '检测到 Focus 崩溃'
+                                        try {
+                                            Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'crash-focus.txt' -Lines @($logSnapshot.CrashLines)
+                                            $summary.artifacts.crashLog = 'crash-focus.txt'
+                                        }
+                                        catch {
+                                            $collectionFailed = $true
+                                        }
+                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'FAIL' -Message '检测到明确属于 Focus 的崩溃或 ANR'
                                     }
                                     else {
                                         Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'PASS' -Message $null

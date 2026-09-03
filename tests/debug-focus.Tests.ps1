@@ -268,7 +268,7 @@ function Invoke-DebugCase {
     $expectedSerial = $null
     if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed', 'pidof-empty',
             'accessibility-failed', 'accessibility-disabled', 'provenance-missing',
-            'dumpsys-failed', 'pm-path-failed')) {
+            'dumpsys-failed', 'pm-path-failed', 'foreign-crash', 'focus-crash')) {
         $expectedSerial = 'TEST123'
     }
     if ($Scenario -eq 'multiple' -and $requestedSerial -eq 'TEST456') {
@@ -544,6 +544,32 @@ try {
     Write-Host 'PASS healthy-device-and-app-state'
 }
 catch { $failures.Add("healthy-device-and-app-state: $($_.Exception.Message)"); Write-Host 'FAIL healthy-device-and-app-state' }
+
+try {
+    $foreign = Invoke-DebugCase -Scenario 'foreign-crash'
+    try {
+        Assert-Equal 0 $foreign.ExitCode '其他应用崩溃不应使脚本失败'
+        Assert-Equal 'PASS' $foreign.Summary.overall '其他应用崩溃被计入总体结果'
+        Assert-Equal 'PASS' (Get-Check $foreign.Summary 'logs.crash').status '其他应用崩溃被误报'
+        Assert-Equal $null $foreign.Summary.artifacts.crashLog '其他应用崩溃不应生成 Focus 崩溃附件'
+        $focusText = Get-Content -LiteralPath (Join-Path $foreign.OutputRoot 'logcat-focus.txt') -Raw -Encoding UTF8
+        if ($focusText -match 'FOREIGN_CRASH_SENTINEL|com\.other\.app') { throw '其他应用崩溃泄露到 Focus 日志' }
+    }
+    finally { Remove-Item -LiteralPath $foreign.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $focusCrash = Invoke-DebugCase -Scenario 'focus-crash'
+    try {
+        Assert-Equal 30 $focusCrash.ExitCode 'Focus 崩溃必须返回诊断失败退出码'
+        Assert-Equal 'FAIL' $focusCrash.Summary.overall 'Focus 崩溃必须使 overall 失败'
+        Assert-Equal 'FAIL' (Get-Check $focusCrash.Summary 'logs.crash').status 'Focus 崩溃检查状态错误'
+        Assert-Equal 'crash-focus.txt' $focusCrash.Summary.artifacts.crashLog 'Focus 崩溃附件路径错误'
+        $crashText = Get-Content -LiteralPath (Join-Path $focusCrash.OutputRoot 'crash-focus.txt') -Raw -Encoding UTF8
+        if ($crashText -notmatch 'FOCUS_CRASH_SENTINEL') { throw 'Focus 崩溃附件缺少异常证据' }
+    }
+    finally { Remove-Item -LiteralPath $focusCrash.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'PASS focus-crash-attribution-and-foreign-isolation'
+}
+catch { $failures.Add("focus-crash-attribution-and-foreign-isolation: $($_.Exception.Message)"); Write-Host 'FAIL focus-crash-attribution-and-foreign-isolation' }
 
 try {
     $customPackage = Invoke-DebugCase -Scenario 'healthy' -ExtraArguments @('-PackageName', 'com.example.focus_debug')
