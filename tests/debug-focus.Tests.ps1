@@ -662,8 +662,22 @@ try {
     $secret = Invoke-DebugCase -Scenario 'secret-log'
     try {
         $text = Get-Content -LiteralPath (Join-Path $secret.OutputRoot 'logcat-focus.txt') -Raw -Encoding UTF8
-        if ($text -match 'sk-secret-value|bearer-secret-value') { throw '日志附件泄露密钥或 bearer token' }
-        if ($text -notmatch '\[REDACTED\]') { throw '日志脱敏没有保留明确替换标记' }
+        $secretExpectations = @(
+            [pscustomobject]@{ Sentinel = 'sk-secret-value'; Redacted = 'apiKey=[REDACTED]' }
+            [pscustomobject]@{ Sentinel = 'bearer-secret-value'; Redacted = 'Authorization: [REDACTED]' }
+            [pscustomobject]@{ Sentinel = 'api-key-colon-sentinel'; Redacted = 'API Key: [REDACTED]' }
+            [pscustomobject]@{ Sentinel = 'apikey-equals-sentinel'; Redacted = 'APIKEY=[REDACTED]' }
+            [pscustomobject]@{ Sentinel = 'authorization-equals-bearer-sentinel'; Redacted = 'authorization=[REDACTED]' }
+            [pscustomobject]@{ Sentinel = 'authorization-colon-bearer-sentinel'; Redacted = 'Authorization : [REDACTED]' }
+        )
+        foreach ($secretExpectation in $secretExpectations) {
+            if ($text -match [regex]::Escape($secretExpectation.Sentinel)) {
+                throw "日志附件泄露密钥或 bearer token: $($secretExpectation.Sentinel)"
+            }
+            if ($text -notmatch [regex]::Escape($secretExpectation.Redacted)) {
+                throw "日志脱敏没有保留明确替换标记: $($secretExpectation.Redacted)"
+            }
+        }
     }
     finally { Remove-Item -LiteralPath $secret.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Host 'PASS logcat-secret-redaction'

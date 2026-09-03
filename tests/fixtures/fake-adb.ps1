@@ -60,6 +60,10 @@ if ($isLogcatRead) {
         @"
 09-02 20:00:00.000  2468  2468 I FocusDebug: package=$fixturePackage apiKey=sk-secret-value
 09-02 20:00:00.001  2468  2468 I FocusDebug: Authorization: Bearer bearer-secret-value
+09-02 20:00:00.002  2468  2468 I FocusDebug: API Key: api-key-colon-sentinel
+09-02 20:00:00.003  2468  2468 I FocusDebug: APIKEY=apikey-equals-sentinel
+09-02 20:00:00.004  2468  2468 I FocusDebug: authorization=Bearer authorization-equals-bearer-sentinel
+09-02 20:00:00.005  2468  2468 I FocusDebug: Authorization : bearer authorization-colon-bearer-sentinel
 "@
         exit 0
     }
