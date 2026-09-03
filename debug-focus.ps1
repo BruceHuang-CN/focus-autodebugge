@@ -412,7 +412,8 @@ function Get-FocusLogSnapshot {
         if ([string]$processId -cmatch '^\d+$') { [void]$focusPidSet.Add([string]$processId) }
     }
     $packagePattern = [regex]::Escape($PackageName)
-    $processPattern = "Process:\s*$packagePattern,\s*PID:\s*(?<pid>\d+)"
+    $packageTokenPattern = "(?<![A-Za-z0-9_.])$packagePattern(?![A-Za-z0-9_.])"
+    $processPattern = "Process:\s*$packageTokenPattern,\s*PID:\s*(?<pid>\d+)"
     foreach ($parsed in $parsedLines) {
         if ($parsed.Raw -cmatch $processPattern) {
             [void]$focusPidSet.Add([string]$matches.pid)
@@ -421,8 +422,8 @@ function Get-FocusLogSnapshot {
 
     $focusLines = [System.Collections.Generic.List[string]]::new()
     foreach ($parsed in $parsedLines) {
-        $belongsToFocus = $focusPidSet.Contains([string]$parsed.ProcessId) -or
-            $parsed.Raw -cmatch $packagePattern
+        # 只有已知 Focus PID 的行可进入附件；任意消息中的包名提及不是归属证明。
+        $belongsToFocus = $focusPidSet.Contains([string]$parsed.ProcessId)
         if ($belongsToFocus) {
             [void]$focusLines.Add((Protect-FocusLogLine -Line $parsed.Raw))
         }
@@ -625,7 +626,7 @@ function Invoke-FocusDebugCollection {
                     $requiredNotPassed = @($summary.checks | Where-Object {
                         $_.id -in $script:RequiredChecks -and $_.status -ne 'PASS'
                     }).Count -gt 0
-                    $exitCode = if ($requiredNotPassed) { 10 } elseif ($collectionFailed) { 30 } else { 0 }
+                    $exitCode = if ($requiredNotPassed) { 10 } elseif ($collectionFailed -or $focusCrashDetected) { 30 } else { 0 }
                 }
                 else {
                     $exitCode = 10

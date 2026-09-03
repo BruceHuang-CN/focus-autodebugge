@@ -134,6 +134,20 @@ function Invoke-FakeAdbStrictWhitelistCase {
     Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-d', '-T', '09-02 20:00:00.000', '-v', 'threadtime', 'EXTRA') -Label 'logcat 尾部多余参数'
     Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '--clear') -Label 'logcat --clear 参数'
     Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-D', '-T', '09-02 20:00:00.000', '-V', 'threadtime') -Label 'logcat 参数大小写变体'
+    Assert-FakeAdbRejectsVector -Arguments @('version', '-d') -Label 'version 未定义 -d 开关'
+    Assert-FakeAdbRejectsVector -Arguments @('devices', '-l', '-D') -Label 'devices 未定义 -D 开关'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'shell', 'getprop', 'ro.product.model', '-v') -Label 'shell 未定义 -v 开关'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-T', '09-02 20:00:00.000', '-d', '-v', 'threadtime') -Label 'logcat 乱序开关'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-d', '-T', '09-02 20:00:00.000', '-v', 'threadtime', '-d') -Label 'logcat 重复开关'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-d', '-T', '09-02 20:00:00.000', 'threadtime', '-v') -Label 'logcat 尾置开关'
+}
+
+function Invoke-ExitCodeFormulaGuardCase {
+    $scriptText = Get-Content -LiteralPath $scriptUnderTest -Raw -Encoding UTF8
+    $formulaPattern = '(?s)\$exitCode\s*=\s*if\s*\(\$requiredNotPassed\).*?\$collectionFailed\s+-or\s+\$focusCrashDetected'
+    if ($scriptText -notmatch $formulaPattern) {
+        throw '退出码公式必须在 required 分支后同时检查 collectionFailed 与 focusCrashDetected'
+    }
 }
 
 function Invoke-MissingAdbCase {
@@ -417,6 +431,15 @@ catch {
 }
 
 try {
+    Invoke-ExitCodeFormulaGuardCase
+    Write-Host 'PASS exit-code-formula-guard'
+}
+catch {
+    $failures.Add("exit-code-formula-guard: $($_.Exception.Message)")
+    Write-Host 'FAIL exit-code-formula-guard'
+}
+
+try {
     $unauthorized = Invoke-DebugCase -Scenario 'unauthorized'
     try {
         Assert-Equal 10 $unauthorized.ExitCode '未授权设备退出码不正确'
@@ -512,6 +535,7 @@ try {
         if ($focusLog -notmatch 'Focus startup complete') { throw 'Focus PID 日志未保留' }
         if ($focusLog -notmatch [regex]::Escape($healthy.PackageName)) { throw 'Focus 包名日志未保留' }
         if ($focusLog -match 'OTHER_PRIVATE_SENTINEL') { throw '其他应用日志泄露到 Focus 附件' }
+        if ($focusLog -match 'OTHER_PACKAGE_SUFFIX_SENTINEL|OTHER_PACKAGE_PREFIX_SENTINEL|OTHER_PACKAGE_EXACT_SENTINEL') { throw '其他 PID 的包名提及泄露到 Focus 附件' }
         if ($healthy.Calls -match '(?m)(?:^|\t)(?:-c|--clear)(?:\t|$)') { throw '日志调用不得包含清空参数' }
     }
     finally {

@@ -1,27 +1,17 @@
-param(
-    [Alias('d')][switch]$DebugFlag,
-    [Alias('v')][switch]$VerboseFlag,
-    [Parameter(ValueFromRemainingArguments = $true)][string[]]$AdbArgs
-)
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$AdbArgs)
 Set-StrictMode -Version Latest
 $scenario = if ($env:FOCUS_FAKE_ADB_SCENARIO) { $env:FOCUS_FAKE_ADB_SCENARIO } else { 'healthy' }
-$rawCommandLine = [Environment]::CommandLine
-$hasExactDebugFlag = $DebugFlag -and $rawCommandLine -cmatch '(?<!\S)-d(?=\s|$)'
-$hasExactVerboseFlag = $VerboseFlag -and $rawCommandLine -cmatch '(?<!\S)-v(?=\s|$)'
-if (($hasExactDebugFlag -or $hasExactVerboseFlag) -and $AdbArgs -contains 'logcat') {
-    $rebuiltArgs = [System.Collections.Generic.List[string]]::new()
-    foreach ($argument in $AdbArgs) {
-        if ($hasExactDebugFlag -and $argument -ceq 'logcat') {
-            [void]$rebuiltArgs.Add($argument)
-            [void]$rebuiltArgs.Add('-d')
-            continue
-        }
-        if ($hasExactVerboseFlag -and $argument -ceq 'threadtime') {
-            [void]$rebuiltArgs.Add('-v')
-        }
-        [void]$rebuiltArgs.Add($argument)
+$commandLineArgs = @([Environment]::GetCommandLineArgs())
+$fileIndex = -1
+for ($index = 0; $index -lt $commandLineArgs.Count; $index++) {
+    if ($commandLineArgs[$index] -ceq '-File') {
+        $fileIndex = $index
+        break
     }
-    $AdbArgs = $rebuiltArgs.ToArray()
+}
+$firstScriptArgument = $fileIndex + 2
+if ($fileIndex -ge 0 -and $firstScriptArgument -lt $commandLineArgs.Count) {
+    $AdbArgs = @($commandLineArgs[$firstScriptArgument..($commandLineArgs.Count - 1)])
 }
 if ($env:FOCUS_FAKE_ADB_CALLS) {
     [IO.File]::AppendAllText($env:FOCUS_FAKE_ADB_CALLS, (($AdbArgs -join "`t") + "`n"))
@@ -43,10 +33,9 @@ if ($AdbArgs.Count -eq 2 -and $AdbArgs[0] -ceq 'devices' -and $AdbArgs[1] -ceq '
     exit 0
 }
 $fixturePackage = if ($env:FOCUS_FAKE_ADB_PACKAGE) { $env:FOCUS_FAKE_ADB_PACKAGE } else { 'com.example.focus_app' }
-$tail = if ($AdbArgs.Count -ge 3 -and $AdbArgs[0] -ceq '-s') {
-    @($AdbArgs[2..($AdbArgs.Count - 1)])
-} else {
-    @()
+[string[]]$tail = [string[]]::new(0)
+if ($AdbArgs.Count -ge 3 -and $AdbArgs[0] -ceq '-s') {
+    $tail = @($AdbArgs[2..($AdbArgs.Count - 1)])
 }
 $tailText = $tail -join ' '
 $isLogcatRead = $tail.Count -eq 6 -and
@@ -62,6 +51,9 @@ if ($isLogcatRead) {
 09-02 20:00:00.000  2468  2468 I FocusDebug: Focus startup complete
 09-02 20:00:00.010  9000  9000 I OtherApp: OTHER_PRIVATE_SENTINEL
 09-02 20:00:00.020  2468  2469 I FocusDebug: package=$fixturePackage ready
+09-02 20:00:00.030  9000  9000 I OtherApp: OTHER_PACKAGE_SUFFIX_SENTINEL package=$fixturePackage.clone
+09-02 20:00:00.040  9000  9000 I OtherApp: OTHER_PACKAGE_PREFIX_SENTINEL package=com.other.$fixturePackage
+09-02 20:00:00.050  9000  9000 I OtherApp: OTHER_PACKAGE_EXACT_SENTINEL mention=$fixturePackage
 "@
     exit 0
 }
