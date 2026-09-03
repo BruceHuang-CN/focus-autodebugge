@@ -397,11 +397,23 @@ function Get-FocusLogSnapshot {
         'MM-dd HH:mm:ss.fff',
         [Globalization.CultureInfo]::InvariantCulture
     )
-    $result = Invoke-Adb -AdbPath $AdbPath -Arguments @(
-        '-s', $Serial, 'logcat', '-d', '-T', $timestamp, '-v', 'threadtime'
-    )
-    if ($result.ExitCode -ne 0) {
-        throw 'Focus 日志读取失败'
+    $logcatError = $null
+    try {
+        $result = Invoke-Adb -AdbPath $AdbPath -Arguments @(
+            '-s', $Serial, 'logcat', '-d', '-T', $timestamp, '-v', 'threadtime'
+        )
+        if ($result.ExitCode -ne 0) { $logcatError = 'logcat 读取失败' }
+    }
+    catch {
+        $logcatError = 'logcat 读取失败'
+    }
+    if ($logcatError) {
+        return [pscustomobject]@{
+            FocusLines = @()
+            CrashLines = @()
+            FocusCrashDetected = $false
+            Error = $logcatError
+        }
     }
 
     $parsedLines = [System.Collections.Generic.List[object]]::new()
@@ -448,6 +460,7 @@ function Get-FocusLogSnapshot {
         FocusLines = @($focusLines.ToArray())
         CrashLines = @($crashLines.ToArray())
         FocusCrashDetected = $focusCrashDetected
+        Error = $null
     }
 }
 
@@ -594,34 +607,40 @@ function Invoke-FocusDebugCollection {
                                         -PackageName $PackageName `
                                         -ProcessIds $appSnapshot.ProcessIds `
                                         -Since ([DateTimeOffset]::Now.AddMinutes(-$LogWindowMinutes))
-                                    $focusCrashDetected = [bool]$logSnapshot.FocusCrashDetected
-                                    $focusLines = @($logSnapshot.FocusLines)
-                                    if ($focusLines.Count -gt 0) {
-                                        try {
-                                            Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'logcat-focus.txt' -Lines $focusLines
-                                            $summary.artifacts.focusLogcat = 'logcat-focus.txt'
-                                            Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message $null
-                                        }
-                                        catch {
-                                            $collectionFailed = $true
-                                            Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'FAIL' -Message 'Focus 日志附件写入失败'
-                                        }
+                                    if ($logSnapshot.Error) {
+                                        Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'FAIL' -Message $logSnapshot.Error
+                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'SKIP' -Message $logSnapshot.Error
                                     }
                                     else {
-                                        Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message '时间窗口内没有 Focus 相关日志'
-                                    }
-                                    if ($focusCrashDetected) {
-                                        try {
-                                            Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'crash-focus.txt' -Lines @($logSnapshot.CrashLines)
-                                            $summary.artifacts.crashLog = 'crash-focus.txt'
+                                        $focusCrashDetected = [bool]$logSnapshot.FocusCrashDetected
+                                        $focusLines = @($logSnapshot.FocusLines)
+                                        if ($focusLines.Count -gt 0) {
+                                            try {
+                                                Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'logcat-focus.txt' -Lines $focusLines
+                                                $summary.artifacts.focusLogcat = 'logcat-focus.txt'
+                                                Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message $null
+                                            }
+                                            catch {
+                                                $collectionFailed = $true
+                                                Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'FAIL' -Message 'Focus 日志附件写入失败'
+                                            }
                                         }
-                                        catch {
-                                            $collectionFailed = $true
+                                        else {
+                                            Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message '时间窗口内没有 Focus 相关日志'
                                         }
-                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'FAIL' -Message '检测到明确属于 Focus 的崩溃或 ANR'
-                                    }
-                                    else {
-                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'PASS' -Message $null
+                                        if ($focusCrashDetected) {
+                                            try {
+                                                Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'crash-focus.txt' -Lines @($logSnapshot.CrashLines)
+                                                $summary.artifacts.crashLog = 'crash-focus.txt'
+                                            }
+                                            catch {
+                                                $collectionFailed = $true
+                                            }
+                                            Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'FAIL' -Message '检测到明确属于 Focus 的崩溃或 ANR'
+                                        }
+                                        else {
+                                            Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'PASS' -Message $null
+                                        }
                                     }
                                 }
                                 catch {

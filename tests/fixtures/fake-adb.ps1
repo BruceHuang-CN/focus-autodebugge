@@ -48,6 +48,21 @@ $isLogcatRead = $tail.Count -eq 6 -and
     $tail[5] -ceq 'threadtime'
 
 if ($isLogcatRead) {
+    if ($scenario -ceq 'no-focus-log') {
+        '09-02 20:00:00.000  9000  9000 I OtherApp: OTHER_ONLY_SENTINEL'
+        exit 0
+    }
+    if ($scenario -ceq 'logcat-failed') {
+        [Console]::Error.WriteLine('模拟 logcat 读取失败')
+        exit 8
+    }
+    if ($scenario -ceq 'secret-log') {
+        @"
+09-02 20:00:00.000  2468  2468 I FocusDebug: package=$fixturePackage apiKey=sk-secret-value
+09-02 20:00:00.001  2468  2468 I FocusDebug: Authorization: Bearer bearer-secret-value
+"@
+        exit 0
+    }
     if ($scenario -ceq 'foreign-crash') {
         @"
 09-02 20:00:00.000  9000  9000 E AndroidRuntime: FATAL EXCEPTION: main

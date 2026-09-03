@@ -269,7 +269,7 @@ function Invoke-DebugCase {
     if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed', 'pidof-empty',
             'accessibility-failed', 'accessibility-disabled', 'provenance-missing',
             'dumpsys-failed', 'pm-path-failed', 'foreign-crash', 'focus-crash',
-            'focus-crash-required-failure')) {
+            'focus-crash-required-failure', 'no-focus-log', 'logcat-failed', 'secret-log')) {
         $expectedSerial = if ($Scenario -in @('focus-crash', 'focus-crash-required-failure')) {
             'FOCUS.SERIAL+SENTINEL'
         } else {
@@ -332,6 +332,47 @@ function Invoke-FocusStateWriteFailureCase {
             Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
         } else { '' }
         Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial 'TEST123'
+        [pscustomobject]@{
+            ExitCode = $exitCode
+            Summary = $summary
+            Calls = $calls
+            Console = $console
+            OutputRoot = $outputRoot
+        }
+    }
+    finally {
+        $env:FOCUS_FAKE_ADB_SCENARIO = $previousScenario
+        $env:FOCUS_FAKE_ADB_CALLS = $previousCalls
+        $env:FOCUS_FAKE_ADB_PACKAGE = $previousPackage
+    }
+}
+
+function Invoke-LogAttachmentWriteFailureCase {
+    param(
+        [string]$Scenario,
+        [string]$FileName
+    )
+    $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ("focus-autodebug-log-dir-" + [guid]::NewGuid())
+    $callsPath = Join-Path $outputRoot 'adb-calls.txt'
+    $fakeAdb = Join-Path $PSScriptRoot 'fixtures\fake-adb.ps1'
+    New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $outputRoot $FileName) -Force | Out-Null
+    $previousScenario = $env:FOCUS_FAKE_ADB_SCENARIO
+    $previousCalls = $env:FOCUS_FAKE_ADB_CALLS
+    $previousPackage = $env:FOCUS_FAKE_ADB_PACKAGE
+    $expectedSerial = if ($Scenario -eq 'focus-crash') { 'FOCUS.SERIAL+SENTINEL' } else { 'TEST123' }
+    try {
+        $env:FOCUS_FAKE_ADB_SCENARIO = $Scenario
+        $env:FOCUS_FAKE_ADB_CALLS = $callsPath
+        $env:FOCUS_FAKE_ADB_PACKAGE = 'com.example.focus_app'
+        $console = & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File $scriptUnderTest `
+            -AdbPath $fakeAdb -OutputRoot $outputRoot 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $summary = Get-Content -LiteralPath (Join-Path $outputRoot 'summary.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $calls = if (Test-Path -LiteralPath $callsPath) {
+            Get-Content -LiteralPath $callsPath -Raw -Encoding UTF8
+        } else { '' }
+        Assert-FakeAdbReadOnlyCalls -Calls $calls -SelectedSerial $expectedSerial
         [pscustomobject]@{
             ExitCode = $exitCode
             Summary = $summary
@@ -592,6 +633,63 @@ try {
     Write-Host 'PASS focus-crash-attachment-serial-redaction'
 }
 catch { $failures.Add("focus-crash-attachment-serial-redaction: $($_.Exception.Message)"); Write-Host 'FAIL focus-crash-attachment-serial-redaction' }
+
+try {
+    $empty = Invoke-DebugCase -Scenario 'no-focus-log'
+    try {
+        Assert-Equal 0 $empty.ExitCode '无 Focus 日志场景应正常完成'
+        Assert-Equal 'PASS' (Get-Check $empty.Summary 'logs.focus').status '无匹配仍应完成日志检查'
+        Assert-Equal $null $empty.Summary.artifacts.focusLogcat '无匹配时不应创建空附件'
+        if ((Get-Check $empty.Summary 'logs.focus').message -notmatch '没有 Focus 相关日志') { throw '无匹配消息不可操作' }
+    }
+    finally { Remove-Item -LiteralPath $empty.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $failed = Invoke-DebugCase -Scenario 'logcat-failed'
+    try {
+        Assert-Equal 0 $failed.ExitCode '可选日志读取失败不应覆盖必需检查结果'
+        Assert-Equal 'PASS' $failed.Summary.overall '可选日志失败不应单独使 overall 失败'
+        Assert-Equal 'FAIL' (Get-Check $failed.Summary 'logs.focus').status '日志读取失败状态错误'
+        Assert-Equal 'SKIP' (Get-Check $failed.Summary 'logs.crash').status '无法读取日志时崩溃检查应跳过'
+        Assert-Equal $null $failed.Summary.artifacts.focusLogcat '日志失败不应创建附件'
+        Assert-Equal 'logcat 读取失败' (Get-Check $failed.Summary 'logs.focus').message '日志读取失败消息必须可操作'
+    }
+    finally { Remove-Item -LiteralPath $failed.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'PASS logcat-empty-and-read-failure-semantics'
+}
+catch { $failures.Add("logcat-empty-and-read-failure-semantics: $($_.Exception.Message)"); Write-Host 'FAIL logcat-empty-and-read-failure-semantics' }
+
+try {
+    $secret = Invoke-DebugCase -Scenario 'secret-log'
+    try {
+        $text = Get-Content -LiteralPath (Join-Path $secret.OutputRoot 'logcat-focus.txt') -Raw -Encoding UTF8
+        if ($text -match 'sk-secret-value|bearer-secret-value') { throw '日志附件泄露密钥或 bearer token' }
+        if ($text -notmatch '\[REDACTED\]') { throw '日志脱敏没有保留明确替换标记' }
+    }
+    finally { Remove-Item -LiteralPath $secret.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'PASS logcat-secret-redaction'
+}
+catch { $failures.Add("logcat-secret-redaction: $($_.Exception.Message)"); Write-Host 'FAIL logcat-secret-redaction' }
+
+try {
+    $focusLogWriteFailure = Invoke-LogAttachmentWriteFailureCase -Scenario 'healthy' -FileName 'logcat-focus.txt'
+    try {
+        Assert-Equal 30 $focusLogWriteFailure.ExitCode 'Focus 日志附件写入失败退出码错误'
+        Assert-Equal 'FAIL' $focusLogWriteFailure.Summary.overall 'Focus 日志附件写入失败必须使 overall 失败'
+        Assert-Equal $true $focusLogWriteFailure.Summary.collectionFailed '日志附件失败信号错误'
+        Assert-Equal $null $focusLogWriteFailure.Summary.artifacts.focusLogcat '写入失败不得保留日志附件指针'
+    }
+    finally { Remove-Item -LiteralPath $focusLogWriteFailure.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $crashLogWriteFailure = Invoke-LogAttachmentWriteFailureCase -Scenario 'focus-crash' -FileName 'crash-focus.txt'
+    try {
+        Assert-Equal 30 $crashLogWriteFailure.ExitCode 'Focus 崩溃日志附件写入失败退出码错误'
+        Assert-Equal $true $crashLogWriteFailure.Summary.collectionFailed '崩溃日志附件失败信号错误'
+        Assert-Equal $null $crashLogWriteFailure.Summary.artifacts.crashLog '写入失败不得保留崩溃日志附件指针'
+    }
+    finally { Remove-Item -LiteralPath $crashLogWriteFailure.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'PASS logcat-attachment-write-failures'
+}
+catch { $failures.Add("logcat-attachment-write-failures: $($_.Exception.Message)"); Write-Host 'FAIL logcat-attachment-write-failures' }
 
 try {
     $focusCrashRequiredFailure = Invoke-DebugCase -Scenario 'focus-crash-required-failure'
