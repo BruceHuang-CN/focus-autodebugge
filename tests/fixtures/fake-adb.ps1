@@ -1,6 +1,28 @@
-param([Parameter(ValueFromRemainingArguments = $true)][string[]]$AdbArgs)
+param(
+    [Alias('d')][switch]$DebugFlag,
+    [Alias('v')][switch]$VerboseFlag,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$AdbArgs
+)
 Set-StrictMode -Version Latest
 $scenario = if ($env:FOCUS_FAKE_ADB_SCENARIO) { $env:FOCUS_FAKE_ADB_SCENARIO } else { 'healthy' }
+$rawCommandLine = [Environment]::CommandLine
+$hasExactDebugFlag = $DebugFlag -and $rawCommandLine -cmatch '(?<!\S)-d(?=\s|$)'
+$hasExactVerboseFlag = $VerboseFlag -and $rawCommandLine -cmatch '(?<!\S)-v(?=\s|$)'
+if (($hasExactDebugFlag -or $hasExactVerboseFlag) -and $AdbArgs -contains 'logcat') {
+    $rebuiltArgs = [System.Collections.Generic.List[string]]::new()
+    foreach ($argument in $AdbArgs) {
+        if ($hasExactDebugFlag -and $argument -ceq 'logcat') {
+            [void]$rebuiltArgs.Add($argument)
+            [void]$rebuiltArgs.Add('-d')
+            continue
+        }
+        if ($hasExactVerboseFlag -and $argument -ceq 'threadtime') {
+            [void]$rebuiltArgs.Add('-v')
+        }
+        [void]$rebuiltArgs.Add($argument)
+    }
+    $AdbArgs = $rebuiltArgs.ToArray()
+}
 if ($env:FOCUS_FAKE_ADB_CALLS) {
     [IO.File]::AppendAllText($env:FOCUS_FAKE_ADB_CALLS, (($AdbArgs -join "`t") + "`n"))
 }
@@ -27,6 +49,22 @@ $tail = if ($AdbArgs.Count -ge 3 -and $AdbArgs[0] -ceq '-s') {
     @()
 }
 $tailText = $tail -join ' '
+$isLogcatRead = $tail.Count -eq 6 -and
+    $tail[0] -ceq 'logcat' -and
+    $tail[1] -ceq '-d' -and
+    $tail[2] -ceq '-T' -and
+    $tail[3] -cmatch '^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$' -and
+    $tail[4] -ceq '-v' -and
+    $tail[5] -ceq 'threadtime'
+
+if ($isLogcatRead) {
+    @"
+09-02 20:00:00.000  2468  2468 I FocusDebug: Focus startup complete
+09-02 20:00:00.010  9000  9000 I OtherApp: OTHER_PRIVATE_SENTINEL
+09-02 20:00:00.020  2468  2469 I FocusDebug: package=$fixturePackage ready
+"@
+    exit 0
+}
 if ($tailText -ceq 'shell getprop ro.product.manufacturer') { 'realme'; exit 0 }
 if ($tailText -ceq 'shell getprop ro.product.model') { 'RMX3350'; exit 0 }
 if ($tailText -ceq 'shell getprop ro.build.version.release') { '11'; exit 0 }

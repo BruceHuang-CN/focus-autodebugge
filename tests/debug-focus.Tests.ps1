@@ -41,6 +41,16 @@ function Assert-FakeAdbReadOnlyCalls {
             $parts[0] -ceq '-s' -and $parts[1] -ceq $SelectedSerial) {
             $tail = (@($parts | Select-Object -Skip 2) -join ' ')
             $allowed = $tail -in $allowedShellTails
+            $allowedLogcat = $parts.Count -eq 8 -and
+                $parts[0] -ceq '-s' -and
+                $parts[1] -ceq $SelectedSerial -and
+                $parts[2] -ceq 'logcat' -and
+                $parts[3] -ceq '-d' -and
+                $parts[4] -ceq '-T' -and
+                $parts[5] -cmatch '^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$' -and
+                $parts[6] -ceq '-v' -and
+                $parts[7] -ceq 'threadtime'
+            $allowed = $allowed -or $allowedLogcat
         }
         if (-not $allowed) {
             throw "fake ADB 调用超出本批次白名单: $line"
@@ -116,6 +126,14 @@ function Invoke-FakeAdbStrictWhitelistCase {
         Assert-FakeAdbRejectsVector -Arguments (@('-s', 'TEST123') + $caseVariant) -Label "$tailText 大小写变体"
         Assert-FakeAdbRejectsVector -Arguments (@('-s', 'TEST123') + @($tail + 'EXTRA')) -Label "$tailText 多余参数"
     }
+
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'LOGCAT', '-d', '-T', '09-02 20:00:00.000', '-v', 'threadtime') -Label 'logcat 大小写变体'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-c') -Label 'logcat 清空参数'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-d', '-v', 'threadtime') -Label 'logcat 缺少 -T'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-d', '-T', '09-02 20:00:00', '-v', 'threadtime') -Label 'logcat 非法时间戳'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-d', '-T', '09-02 20:00:00.000', '-v', 'threadtime', 'EXTRA') -Label 'logcat 尾部多余参数'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '--clear') -Label 'logcat --clear 参数'
+    Assert-FakeAdbRejectsVector -Arguments @('-s', 'TEST123', 'logcat', '-D', '-T', '09-02 20:00:00.000', '-V', 'threadtime') -Label 'logcat 参数大小写变体'
 }
 
 function Invoke-MissingAdbCase {
@@ -464,6 +482,13 @@ try {
         }
         Assert-Equal 'device-info.txt' $healthy.Summary.artifacts.deviceInfo '设备附件路径错误'
         Assert-Equal 'focus-state.txt' $healthy.Summary.artifacts.focusState 'Focus 附件路径错误'
+        Assert-Equal 'PASS' (Get-Check $healthy.Summary 'logs.focus').status 'Focus 日志检查状态错误'
+        Assert-Equal 'PASS' (Get-Check $healthy.Summary 'logs.crash').status '无崩溃场景状态错误'
+        Assert-Equal 'logcat-focus.txt' $healthy.Summary.artifacts.focusLogcat 'Focus 日志附件路径错误'
+        Assert-Equal $null $healthy.Summary.artifacts.crashLog '健康场景不应存在崩溃附件'
+
+        $summaryJson = $healthy.Summary | ConvertTo-Json -Depth 8
+        if ($summaryJson -match '(?<!\d)2468(?!\d)') { throw 'PID 不应写入摘要' }
 
         $deviceInfo = Get-Content -LiteralPath (Join-Path $healthy.OutputRoot 'device-info.txt') -Raw -Encoding UTF8
         $deviceInfo = ($deviceInfo -replace "`r`n", "`n").Trim()
@@ -478,9 +503,16 @@ try {
         Assert-TextKeyValue $focusState 'lastUpdateTime' '2026-09-02 12:34:56' 'Focus 附件更新时间错误'
         Assert-TextKeyValue $focusState 'processAlive' 'true' 'Focus 附件进程状态错误'
         Assert-TextKeyValue $focusState 'accessibilityEnabled' 'true' 'Focus 附件无障碍状态错误'
+        if ($focusState -match '(?<!\d)2468(?!\d)') { throw 'PID 不应写入 Focus 附件' }
         if ($focusState -match 'com\.other\.app|OtherAccessibilityService|enabled_accessibility_services') {
             throw 'Focus 附件不应写入其他应用的无障碍服务列表'
         }
+
+        $focusLog = Get-Content -LiteralPath (Join-Path $healthy.OutputRoot 'logcat-focus.txt') -Raw -Encoding UTF8
+        if ($focusLog -notmatch 'Focus startup complete') { throw 'Focus PID 日志未保留' }
+        if ($focusLog -notmatch [regex]::Escape($healthy.PackageName)) { throw 'Focus 包名日志未保留' }
+        if ($focusLog -match 'OTHER_PRIVATE_SENTINEL') { throw '其他应用日志泄露到 Focus 附件' }
+        if ($healthy.Calls -match '(?m)(?:^|\t)(?:-c|--clear)(?:\t|$)') { throw '日志调用不得包含清空参数' }
     }
     finally {
         Remove-Item -LiteralPath $healthy.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -237,6 +237,7 @@ function Get-AppSnapshot {
         VersionCode = $null
         LastUpdateTime = $null
         ProcessAlive = $null
+        ProcessIds = @()
         AccessibilityEnabled = $null
         InstalledCheck = 'FAIL'
         ProvenanceCheck = 'SKIP'
@@ -299,6 +300,12 @@ function Get-AppSnapshot {
         $processError = $processResult.StdErr.Trim()
         if ($processResult.ExitCode -eq 0) {
             $snapshot.ProcessAlive = [bool]$processOutput
+            if ($processOutput) {
+                $snapshot.ProcessIds = @(
+                    $processOutput -split '\s+' |
+                        Where-Object { $_ -cmatch '^\d+$' }
+                )
+            }
             $snapshot.ProcessCheck = 'PASS'
         }
         elseif ($processResult.ExitCode -eq 1 -and -not $processOutput -and -not $processError) {
@@ -351,6 +358,81 @@ function Convert-ToStateValue {
     if ($null -eq $Value) { return 'null' }
     if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
     return [string]$Value
+}
+
+function ConvertFrom-ThreadtimeLine {
+    param([string]$Line)
+    $pattern = '^(?<timestamp>\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+(?<pid>\d+)\s+(?<tid>\d+)\s+(?<priority>[VDIWEF])\s+(?<tag>[^:]+):\s?(?<message>.*)$'
+    if ($Line -cnotmatch $pattern) { return $null }
+    [pscustomobject]@{
+        Raw = $Line
+        Timestamp = $matches.timestamp
+        ProcessId = $matches.pid
+        ThreadId = $matches.tid
+        Priority = $matches.priority
+        Tag = $matches.tag.Trim()
+        Message = $matches.message
+    }
+}
+
+function Protect-FocusLogLine {
+    param([string]$Line)
+    $redacted = $Line -replace '(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+', '$1[REDACTED]'
+    $redacted = $redacted -replace '(?i)((?:api[-_ ]?key|token)\s*[:=]\s*)[^\s,;]+', '$1[REDACTED]'
+    return $redacted
+}
+
+function Get-FocusLogSnapshot {
+    param(
+        [string]$AdbPath,
+        [string]$Serial,
+        [string]$PackageName,
+        [string[]]$ProcessIds,
+        [DateTimeOffset]$Since
+    )
+    $timestamp = $Since.LocalDateTime.ToString(
+        'MM-dd HH:mm:ss.fff',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    $result = Invoke-Adb -AdbPath $AdbPath -Arguments @(
+        '-s', $Serial, 'logcat', '-d', '-T', $timestamp, '-v', 'threadtime'
+    )
+    if ($result.ExitCode -ne 0) {
+        throw 'Focus 日志读取失败'
+    }
+
+    $parsedLines = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in ($result.StdOut -split "`r?`n")) {
+        $parsed = ConvertFrom-ThreadtimeLine -Line $line
+        if ($null -ne $parsed) { [void]$parsedLines.Add($parsed) }
+    }
+
+    $focusPidSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($processId in @($ProcessIds)) {
+        if ([string]$processId -cmatch '^\d+$') { [void]$focusPidSet.Add([string]$processId) }
+    }
+    $packagePattern = [regex]::Escape($PackageName)
+    $processPattern = "Process:\s*$packagePattern,\s*PID:\s*(?<pid>\d+)"
+    foreach ($parsed in $parsedLines) {
+        if ($parsed.Raw -cmatch $processPattern) {
+            [void]$focusPidSet.Add([string]$matches.pid)
+        }
+    }
+
+    $focusLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($parsed in $parsedLines) {
+        $belongsToFocus = $focusPidSet.Contains([string]$parsed.ProcessId) -or
+            $parsed.Raw -cmatch $packagePattern
+        if ($belongsToFocus) {
+            [void]$focusLines.Add((Protect-FocusLogLine -Line $parsed.Raw))
+        }
+    }
+
+    [pscustomobject]@{
+        FocusLines = @($focusLines.ToArray())
+        CrashLines = @()
+        FocusCrashDetected = $false
+    }
 }
 
 function Write-DebugAttachment {
@@ -486,6 +568,43 @@ function Invoke-FocusDebugCollection {
                             }
                             catch {
                                 $collectionFailed = $true
+                            }
+
+                            if ($appSnapshot.Installed -eq $true) {
+                                try {
+                                    $logSnapshot = Get-FocusLogSnapshot `
+                                        -AdbPath $resolvedAdb `
+                                        -Serial $selectedSerial `
+                                        -PackageName $PackageName `
+                                        -ProcessIds $appSnapshot.ProcessIds `
+                                        -Since ([DateTimeOffset]::Now.AddMinutes(-$LogWindowMinutes))
+                                    $focusCrashDetected = [bool]$logSnapshot.FocusCrashDetected
+                                    $focusLines = @($logSnapshot.FocusLines)
+                                    if ($focusLines.Count -gt 0) {
+                                        try {
+                                            Write-DebugAttachment -OutputRoot $OutputRoot -FileName 'logcat-focus.txt' -Lines $focusLines
+                                            $summary.artifacts.focusLogcat = 'logcat-focus.txt'
+                                            Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message $null
+                                        }
+                                        catch {
+                                            $collectionFailed = $true
+                                            Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'FAIL' -Message 'Focus 日志附件写入失败'
+                                        }
+                                    }
+                                    else {
+                                        Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'PASS' -Message '时间窗口内没有 Focus 相关日志'
+                                    }
+                                    if ($focusCrashDetected) {
+                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'FAIL' -Message '检测到 Focus 崩溃'
+                                    }
+                                    else {
+                                        Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'PASS' -Message $null
+                                    }
+                                }
+                                catch {
+                                    Set-DebugCheck -Summary $summary -Id 'logs.focus' -Status 'FAIL' -Message 'Focus 日志读取失败'
+                                    Set-DebugCheck -Summary $summary -Id 'logs.crash' -Status 'SKIP' -Message 'Focus 日志读取失败'
+                                }
                             }
                         }
                         catch {
