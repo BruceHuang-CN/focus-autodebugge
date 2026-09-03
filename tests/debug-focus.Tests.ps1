@@ -144,9 +144,9 @@ function Invoke-FakeAdbStrictWhitelistCase {
 
 function Invoke-ExitCodeFormulaGuardCase {
     $scriptText = Get-Content -LiteralPath $scriptUnderTest -Raw -Encoding UTF8
-    $formulaPattern = '(?s)\$exitCode\s*=\s*if\s*\(\$requiredNotPassed\).*?\$collectionFailed\s+-or\s+\$focusCrashDetected'
+    $formulaPattern = '(?s)\$exitCode\s*=\s*if\s*\(\$focusCrashDetected\).*?elseif\s*\(\$requiredNotPassed\).*?elseif\s*\(\$collectionFailed\)'
     if ($scriptText -notmatch $formulaPattern) {
-        throw '退出码公式必须在 required 分支后同时检查 collectionFailed 与 focusCrashDetected'
+        throw '退出码公式必须让 Focus 崩溃优先于 required 与 collection 失败'
     }
 }
 
@@ -268,8 +268,13 @@ function Invoke-DebugCase {
     $expectedSerial = $null
     if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed', 'pidof-empty',
             'accessibility-failed', 'accessibility-disabled', 'provenance-missing',
-            'dumpsys-failed', 'pm-path-failed', 'foreign-crash', 'focus-crash')) {
-        $expectedSerial = 'TEST123'
+            'dumpsys-failed', 'pm-path-failed', 'foreign-crash', 'focus-crash',
+            'focus-crash-required-failure')) {
+        $expectedSerial = if ($Scenario -in @('focus-crash', 'focus-crash-required-failure')) {
+            'FOCUS.SERIAL+SENTINEL'
+        } else {
+            'TEST123'
+        }
     }
     if ($Scenario -eq 'multiple' -and $requestedSerial -eq 'TEST456') {
         $expectedSerial = 'TEST456'
@@ -570,6 +575,36 @@ try {
     Write-Host 'PASS focus-crash-attribution-and-foreign-isolation'
 }
 catch { $failures.Add("focus-crash-attribution-and-foreign-isolation: $($_.Exception.Message)"); Write-Host 'FAIL focus-crash-attribution-and-foreign-isolation' }
+
+try {
+    $focusCrashPrivacy = Invoke-DebugCase -Scenario 'focus-crash'
+    try {
+        $focusCrashSerial = 'FOCUS.SERIAL+SENTINEL'
+        $focusText = Get-Content -LiteralPath (Join-Path $focusCrashPrivacy.OutputRoot 'logcat-focus.txt') -Raw -Encoding UTF8
+        if ($focusText -match [regex]::Escape($focusCrashSerial)) { throw '完整设备序列号泄露到 Focus 日志附件' }
+        if ($focusText -notmatch 'deviceSerial=\[REDACTED\]') { throw 'Focus 日志附件未保留固定序列号掩码' }
+        $crashText = Get-Content -LiteralPath (Join-Path $focusCrashPrivacy.OutputRoot 'crash-focus.txt') -Raw -Encoding UTF8
+        if ($crashText -match [regex]::Escape($focusCrashSerial)) { throw '完整设备序列号泄露到 Focus 崩溃附件' }
+        if ($crashText -notmatch 'deviceSerial=\[REDACTED\]') { throw 'Focus 崩溃附件未保留固定序列号掩码' }
+        if ($crashText -notmatch 'FOCUS_CRASH_SENTINEL') { throw '序列号脱敏后 Focus 崩溃附件缺少异常证据' }
+    }
+    finally { Remove-Item -LiteralPath $focusCrashPrivacy.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'PASS focus-crash-attachment-serial-redaction'
+}
+catch { $failures.Add("focus-crash-attachment-serial-redaction: $($_.Exception.Message)"); Write-Host 'FAIL focus-crash-attachment-serial-redaction' }
+
+try {
+    $focusCrashRequiredFailure = Invoke-DebugCase -Scenario 'focus-crash-required-failure'
+    try {
+        Assert-Equal 30 $focusCrashRequiredFailure.ExitCode 'Focus 崩溃必须优先于 required 检查失败返回 30'
+        Assert-Equal 'FAIL' $focusCrashRequiredFailure.Summary.overall 'Focus 崩溃与 required 检查失败必须使 overall 失败'
+        Assert-Equal 'FAIL' (Get-Check $focusCrashRequiredFailure.Summary 'device.info').status '组合场景必须保留 required 检查失败'
+        Assert-Equal 'FAIL' (Get-Check $focusCrashRequiredFailure.Summary 'logs.crash').status '组合场景 Focus 崩溃检查状态错误'
+    }
+    finally { Remove-Item -LiteralPath $focusCrashRequiredFailure.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'PASS focus-crash-priority-over-required-failure'
+}
+catch { $failures.Add("focus-crash-priority-over-required-failure: $($_.Exception.Message)"); Write-Host 'FAIL focus-crash-priority-over-required-failure' }
 
 try {
     $customPackage = Invoke-DebugCase -Scenario 'healthy' -ExtraArguments @('-PackageName', 'com.example.focus_debug')

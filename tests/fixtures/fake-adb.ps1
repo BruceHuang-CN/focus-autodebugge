@@ -1,6 +1,7 @@
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$AdbArgs)
 Set-StrictMode -Version Latest
 $scenario = if ($env:FOCUS_FAKE_ADB_SCENARIO) { $env:FOCUS_FAKE_ADB_SCENARIO } else { 'healthy' }
+$fixtureSerial = if ($scenario -in @('focus-crash', 'focus-crash-required-failure')) { 'FOCUS.SERIAL+SENTINEL' } else { 'TEST123' }
 $commandLineArgs = @([Environment]::GetCommandLineArgs())
 $fileIndex = -1
 for ($index = 0; $index -lt $commandLineArgs.Count; $index++) {
@@ -28,7 +29,7 @@ if ($AdbArgs.Count -eq 2 -and $AdbArgs[0] -ceq 'devices' -and $AdbArgs[1] -ceq '
             'TEST123 device product:test model:Phone_A transport_id:1'
             'TEST456 device product:test model:Phone_B transport_id:2'
         }
-        default { 'TEST123 device product:test model:RMX3350 transport_id:1' }
+        default { "$fixtureSerial device product:test model:RMX3350 transport_id:1" }
     }
     exit 0
 }
@@ -56,11 +57,11 @@ if ($isLogcatRead) {
 "@
         exit 0
     }
-    if ($scenario -ceq 'focus-crash') {
+    if ($scenario -in @('focus-crash', 'focus-crash-required-failure')) {
         @"
 09-02 20:00:00.000  2468  2468 E AndroidRuntime: FATAL EXCEPTION: main
 09-02 20:00:00.001  2468  2468 E AndroidRuntime: Process: $fixturePackage, PID: 2468
-09-02 20:00:00.002  2468  2468 E AndroidRuntime: java.lang.IllegalStateException: FOCUS_CRASH_SENTINEL
+09-02 20:00:00.002  2468  2468 E AndroidRuntime: java.lang.IllegalStateException: FOCUS_CRASH_SENTINEL deviceSerial=$fixtureSerial
 "@
         exit 0
     }
@@ -75,7 +76,13 @@ if ($isLogcatRead) {
     exit 0
 }
 if ($tailText -ceq 'shell getprop ro.product.manufacturer') { 'realme'; exit 0 }
-if ($tailText -ceq 'shell getprop ro.product.model') { 'RMX3350'; exit 0 }
+if ($tailText -ceq 'shell getprop ro.product.model') {
+    if ($scenario -eq 'focus-crash-required-failure') {
+        [Console]::Error.WriteLine('模拟设备型号读取失败')
+        exit 7
+    }
+    'RMX3350'; exit 0
+}
 if ($tailText -ceq 'shell getprop ro.build.version.release') { '11'; exit 0 }
 if ($tailText -ceq 'shell getprop ro.build.version.sdk') { '30'; exit 0 }
 if ($tailText -ceq "shell pm path $fixturePackage") {

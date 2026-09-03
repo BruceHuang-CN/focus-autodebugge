@@ -376,9 +376,12 @@ function ConvertFrom-ThreadtimeLine {
 }
 
 function Protect-FocusLogLine {
-    param([string]$Line)
+    param([string]$Line, [string]$Serial)
     $redacted = $Line -replace '(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+', '$1[REDACTED]'
     $redacted = $redacted -replace '(?i)((?:api[-_ ]?key|token)\s*[:=]\s*)[^\s,;]+', '$1[REDACTED]'
+    if ($Serial) {
+        $redacted = $redacted -replace [regex]::Escape($Serial), '[REDACTED]'
+    }
     return $redacted
 }
 
@@ -430,14 +433,14 @@ function Get-FocusLogSnapshot {
         # 只有已知 Focus PID 的行可进入附件；任意消息中的包名提及不是归属证明。
         $belongsToFocus = $focusPidSet.Contains([string]$parsed.ProcessId)
         if ($belongsToFocus) {
-            [void]$focusLines.Add((Protect-FocusLogLine -Line $parsed.Raw))
+            [void]$focusLines.Add((Protect-FocusLogLine -Line $parsed.Raw -Serial $Serial))
         }
         $fatal = ($parsed.Message -cmatch '^FATAL EXCEPTION:') -and $belongsToFocus
         $anr = $parsed.Message -cmatch "^ANR in $packagePattern(?:\s|$)"
         $tombstone = $parsed.Message -cmatch $tombstonePackagePattern
         if ($fatal -or $anr -or $tombstone) { $focusCrashDetected = $true }
         if (($parsed.Tag -ceq 'AndroidRuntime' -and $belongsToFocus) -or $anr -or $tombstone) {
-            [void]$crashLines.Add((Protect-FocusLogLine -Line $parsed.Raw))
+            [void]$crashLines.Add((Protect-FocusLogLine -Line $parsed.Raw -Serial $Serial))
         }
     }
 
@@ -645,7 +648,7 @@ function Invoke-FocusDebugCollection {
                     $requiredNotPassed = @($summary.checks | Where-Object {
                         $_.id -in $script:RequiredChecks -and $_.status -ne 'PASS'
                     }).Count -gt 0
-                    $exitCode = if ($requiredNotPassed) { 10 } elseif ($collectionFailed -or $focusCrashDetected) { 30 } else { 0 }
+                    $exitCode = if ($focusCrashDetected) { 30 } elseif ($requiredNotPassed) { 10 } elseif ($collectionFailed) { 30 } else { 0 }
                 }
                 else {
                     $exitCode = 10
