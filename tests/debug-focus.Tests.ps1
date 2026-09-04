@@ -1,6 +1,7 @@
 param(
     [switch]$OnlyShortSerial,
-    [switch]$OnlyPidofEmpty
+    [switch]$OnlyPidofEmpty,
+    [switch]$OnlySmallGuardrails
 )
 
 Set-StrictMode -Version Latest
@@ -341,6 +342,7 @@ function Invoke-DebugCase {
     if ($Scenario -in @('healthy', 'not-installed', 'stopped', 'pidof-failed', 'pidof-empty',
             'accessibility-failed', 'accessibility-disabled', 'provenance-missing',
             'dumpsys-failed', 'pm-path-failed', 'foreign-crash', 'focus-crash',
+            'focus-crash-process-source', 'focus-crash-tombstone-source',
             'focus-crash-required-failure', 'no-focus-log', 'logcat-failed', 'secret-log')) {
         $expectedSerial = if ($Scenario -in @('focus-crash', 'focus-crash-required-failure')) {
             'FOCUS.SERIAL+SENTINEL'
@@ -547,6 +549,59 @@ function Invoke-PidofEmptyCase {
     }
 }
 
+function Assert-CrashPidSourceCases {
+    foreach ($pidSource in @(
+        [pscustomobject]@{ Scenario = 'focus-crash-process-source'; Sentinel = 'PROCESS_PID_SOURCE_SENTINEL' }
+        [pscustomobject]@{ Scenario = 'focus-crash-tombstone-source'; Sentinel = 'TOMBSTONE_PID_SOURCE_SENTINEL' }
+    )) {
+        $crash = Invoke-DebugCase -Scenario $pidSource.Scenario
+        try {
+            Assert-Equal 30 $crash.ExitCode "$($pidSource.Scenario) 必须识别为 Focus 崩溃"
+            Assert-Equal 'FAIL' (Get-Check $crash.Summary 'logs.crash').status "$($pidSource.Scenario) 崩溃状态错误"
+            $crashText = Get-Content -LiteralPath (Join-Path $crash.OutputRoot 'crash-focus.txt') -Raw -Encoding UTF8
+            if ($crashText -notmatch $pidSource.Sentinel) {
+                throw "$($pidSource.Scenario) 未通过对应来源归属 PID"
+            }
+        }
+        finally { Remove-Item -LiteralPath $crash.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-SmallGuardrailCases {
+    $healthy = Invoke-DebugCase -Scenario 'healthy'
+    try {
+        $ids = @($healthy.Summary.checks | ForEach-Object id)
+        Assert-Equal 9 $ids.Count '健康摘要必须恰好包含 9 个检查项'
+    }
+    finally { Remove-Item -LiteralPath $healthy.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+    Assert-CrashPidSourceCases
+
+    $empty = Invoke-DebugCase -Scenario 'no-focus-log'
+    try {
+        Assert-Equal $null $empty.Summary.artifacts.focusLogcat '无匹配时不应保留 Focus 日志附件指针'
+        if (Test-Path -LiteralPath (Join-Path $empty.OutputRoot 'logcat-focus.txt')) {
+            throw '无匹配时不应创建物理 Focus 日志附件'
+        }
+    }
+    finally { Remove-Item -LiteralPath $empty.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $failed = Invoke-DebugCase -Scenario 'logcat-failed'
+    try {
+        Assert-Equal $false $failed.Summary.collectionFailed '可选 logcat 读取失败不应标记采集失败'
+        Assert-Equal $null $failed.Summary.artifacts.focusLogcat 'logcat 读取失败不应保留 Focus 日志附件指针'
+        Assert-Equal $null $failed.Summary.artifacts.crashLog 'logcat 读取失败不应保留崩溃附件指针'
+    }
+    finally { Remove-Item -LiteralPath $failed.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $writeFailure = Invoke-LogAttachmentWriteFailureCase -Scenario 'focus-crash' -FileName 'crash-focus.txt'
+    try {
+        Assert-Equal 'FAIL' $writeFailure.Summary.overall '崩溃附件写入冲突必须使 overall 失败'
+        Assert-Equal 'FAIL' (Get-Check $writeFailure.Summary 'logs.crash').status '崩溃附件写入冲突必须使崩溃检查失败'
+    }
+    finally { Remove-Item -LiteralPath $writeFailure.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 if ($OnlyShortSerial) {
     try {
         Invoke-ShortRequestedSerialCase
@@ -569,6 +624,22 @@ if ($OnlyPidofEmpty) {
     catch {
         $failures.Add("pidof-empty: $($_.Exception.Message)")
         Write-Host 'FAIL pidof-empty'
+    }
+    if ($failures.Count -gt 0) {
+        $failures | ForEach-Object { Write-Error $_ }
+        exit 1
+    }
+    exit 0
+}
+
+if ($OnlySmallGuardrails) {
+    try {
+        Invoke-SmallGuardrailCases
+        Write-Host 'PASS small-guardrails'
+    }
+    catch {
+        $failures.Add("small-guardrails: $($_.Exception.Message)")
+        Write-Host 'FAIL small-guardrails'
     }
     if ($failures.Count -gt 0) {
         $failures | ForEach-Object { Write-Error $_ }
@@ -670,6 +741,7 @@ try {
         [void][DateTimeOffset]::Parse($healthy.Summary.startedAt)
         [void][DateTimeOffset]::Parse($healthy.Summary.completedAt)
         $ids = @($healthy.Summary.checks | ForEach-Object id)
+        Assert-Equal 9 $ids.Count '健康摘要必须恰好包含 9 个检查项'
         foreach ($id in @(
             'environment.adb','device.authorized','device.info','app.installed',
             'app.provenance','app.process','permission.accessibility','logs.focus','logs.crash'
@@ -771,6 +843,15 @@ try {
 catch { $failures.Add("focus-crash-attribution-and-foreign-isolation: $($_.Exception.Message)"); Write-Host 'FAIL focus-crash-attribution-and-foreign-isolation' }
 
 try {
+    Assert-CrashPidSourceCases
+    Write-Host 'PASS focus-crash-process-and-tombstone-pid-sources'
+}
+catch {
+    $failures.Add("focus-crash-process-and-tombstone-pid-sources: $($_.Exception.Message)")
+    Write-Host 'FAIL focus-crash-process-and-tombstone-pid-sources'
+}
+
+try {
     $focusCrashPrivacy = Invoke-DebugCase -Scenario 'focus-crash'
     try {
         $focusCrashSerial = 'FOCUS.SERIAL+SENTINEL'
@@ -793,6 +874,7 @@ try {
         Assert-Equal 0 $empty.ExitCode '无 Focus 日志场景应正常完成'
         Assert-Equal 'PASS' (Get-Check $empty.Summary 'logs.focus').status '无匹配仍应完成日志检查'
         Assert-Equal $null $empty.Summary.artifacts.focusLogcat '无匹配时不应创建空附件'
+        if (Test-Path -LiteralPath (Join-Path $empty.OutputRoot 'logcat-focus.txt')) { throw '无匹配时不应创建物理 Focus 日志附件' }
         if ((Get-Check $empty.Summary 'logs.focus').message -notmatch '没有 Focus 相关日志') { throw '无匹配消息不可操作' }
     }
     finally { Remove-Item -LiteralPath $empty.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -803,7 +885,9 @@ try {
         Assert-Equal 'PASS' $failed.Summary.overall '可选日志失败不应单独使 overall 失败'
         Assert-Equal 'FAIL' (Get-Check $failed.Summary 'logs.focus').status '日志读取失败状态错误'
         Assert-Equal 'SKIP' (Get-Check $failed.Summary 'logs.crash').status '无法读取日志时崩溃检查应跳过'
+        Assert-Equal $false $failed.Summary.collectionFailed '可选日志读取失败不应标记采集失败'
         Assert-Equal $null $failed.Summary.artifacts.focusLogcat '日志失败不应创建附件'
+        Assert-Equal $null $failed.Summary.artifacts.crashLog '日志失败不应创建崩溃附件'
         Assert-Equal 'logcat 读取失败' (Get-Check $failed.Summary 'logs.focus').message '日志读取失败消息必须可操作'
     }
     finally { Remove-Item -LiteralPath $failed.OutputRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -850,6 +934,8 @@ try {
     $crashLogWriteFailure = Invoke-LogAttachmentWriteFailureCase -Scenario 'focus-crash' -FileName 'crash-focus.txt'
     try {
         Assert-Equal 30 $crashLogWriteFailure.ExitCode 'Focus 崩溃日志附件写入失败退出码错误'
+        Assert-Equal 'FAIL' $crashLogWriteFailure.Summary.overall 'Focus 崩溃日志附件写入失败必须使 overall 失败'
+        Assert-Equal 'FAIL' (Get-Check $crashLogWriteFailure.Summary 'logs.crash').status 'Focus 崩溃日志附件写入失败状态错误'
         Assert-Equal $true $crashLogWriteFailure.Summary.collectionFailed '崩溃日志附件失败信号错误'
         Assert-Equal $null $crashLogWriteFailure.Summary.artifacts.crashLog '写入失败不得保留崩溃日志附件指针'
     }

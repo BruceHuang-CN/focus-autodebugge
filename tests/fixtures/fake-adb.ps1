@@ -84,6 +84,22 @@ if ($isLogcatRead) {
 "@
         exit 0
     }
+    if ($scenario -ceq 'focus-crash-process-source') {
+        @"
+09-02 20:00:00.000  3579  3579 E AndroidRuntime: FATAL EXCEPTION: main
+09-02 20:00:00.001  3579  3579 E AndroidRuntime: Process: $fixturePackage, PID: 3579
+09-02 20:00:00.002  3579  3579 E AndroidRuntime: java.lang.IllegalStateException: PROCESS_PID_SOURCE_SENTINEL
+"@
+        exit 0
+    }
+    if ($scenario -ceq 'focus-crash-tombstone-source') {
+        @"
+09-02 20:00:00.000  4680  4680 E AndroidRuntime: FATAL EXCEPTION: main
+09-02 20:00:00.001  4680  4680 F DEBUG: pid: 4680, tid: 4680, name: focus  >>> $fixturePackage <<<
+09-02 20:00:00.002  4680  4680 E AndroidRuntime: java.lang.IllegalStateException: TOMBSTONE_PID_SOURCE_SENTINEL
+"@
+        exit 0
+    }
     @"
 09-02 20:00:00.000  2468  2468 I FocusDebug: Focus startup complete
 09-02 20:00:00.010  9000  9000 I OtherApp: OTHER_PRIVATE_SENTINEL
@@ -135,7 +151,7 @@ Packages:
 }
 if ($tailText -ceq "shell pidof $fixturePackage") {
     if ($scenario -eq 'stopped') { exit 1 }
-    if ($scenario -eq 'pidof-empty') { exit 0 }
+    if ($scenario -in @('pidof-empty', 'focus-crash-process-source', 'focus-crash-tombstone-source')) { exit 0 }
     if ($scenario -eq 'pidof-failed') {
         [Console]::Error.WriteLine('模拟 pidof 失败')
         exit 7
