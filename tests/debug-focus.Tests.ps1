@@ -175,13 +175,24 @@ function Invoke-ProductionReadOnlyCommandGuardCase {
     $source = Get-Content -LiteralPath $scriptUnderTest -Raw -Encoding UTF8
     $forbiddenPatterns = @(
         "(?i)@\([^\)]*'logcat'[^\)]*'-c'",
-        "(?i)@\([^\)]*'install'",
+        "(?i)@\([^\)]*'install(?:-[a-z0-9-]+)?'",
         "(?i)@\([^\)]*'uninstall'",
         "(?i)@\([^\)]*'pm'\s*,\s*'clear'",
-        "(?i)@\([^\)]*'pm'\s*,\s*'grant'",
+        "(?i)@\([^\)]*'pm'\s*,\s*'(?:grant|revoke)'",
         "(?i)@\([^\)]*'settings'\s*,\s*'put'",
-        "(?i)@\([^\)]*'input'\s*,\s*'(?:tap|swipe|keyevent|text)'"
+        "(?i)@\([^\)]*'input'\s*,\s*(?:'[a-z0-9_-]+'\s*,\s*)?'(?:tap|swipe|keyevent|text)'"
     )
+    $forbiddenCommandSamples = @(
+        [pscustomobject]@{ Label = 'install-multiple'; Source = "@('-s', 'TEST123', 'install-multiple', 'base.apk')" }
+        [pscustomobject]@{ Label = 'cmd package install-existing'; Source = "@('-s', 'TEST123', 'shell', 'cmd', 'package', 'install-existing', 'com.example.focus_app')" }
+        [pscustomobject]@{ Label = 'pm revoke'; Source = "@('-s', 'TEST123', 'shell', 'pm', 'revoke', 'com.example.focus_app', 'android.permission.CAMERA')" }
+        [pscustomobject]@{ Label = 'input touchscreen swipe'; Source = "@('-s', 'TEST123', 'shell', 'input', 'touchscreen', 'swipe', '1', '2', '3', '4')" }
+    )
+    foreach ($sample in $forbiddenCommandSamples) {
+        if (@($forbiddenPatterns | Where-Object { $sample.Source -match $_ }).Count -eq 0) {
+            throw "危险命令护栏未拒绝样本: $($sample.Label)"
+        }
+    }
     foreach ($pattern in $forbiddenPatterns) {
         if ($source -match $pattern) { throw "生产脚本包含禁止的状态修改调用: $pattern" }
     }
